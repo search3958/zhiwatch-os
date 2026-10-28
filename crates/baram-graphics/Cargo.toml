@@ -1,0 +1,15 @@
+[package]
+name = "baram-graphics"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["ttf"]
+ttf = ["baram-font/ttf"]
+bdf = ["baram-font/bdf"]
+
+[dependencies]
+baram-core = { path = "../baram-core", default-features = false }
+baram-font = { path = "../baram-font", default-features = false }
+libm = { workspace = true }
+kurbo = { workspace = true }

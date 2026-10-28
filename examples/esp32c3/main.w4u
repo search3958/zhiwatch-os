@@ -1,0 +1,9 @@
+<LinearLayout layout_width="match_parent" layout_height="match_parent" orientation="vertical" padding="6dp" background="#1C1C1E">
+    <TextView id="title" layout_width="match_parent" layout_height="wrap_content" text="Baram Warp 4" textSize="16sp" textColor="#F2F2F7" padding="4dp" />
+    <TextView id="subtitle" layout_width="match_parent" layout_height="wrap_content" text="ESP32-C3 / ICST7789V" textSize="10sp" textColor="#A0A0A8" padding="2dp" />
+    <View layout_width="match_parent" layout_height="1dp" background="#545458" layout_marginTop="4dp" layout_marginBottom="6dp" />
+    <Button id="button_test" layout_width="match_parent" layout_height="32dp" text="Joystick select" />
+    <CheckBox id="check_test" layout_width="match_parent" layout_height="28dp" text="Check input" />
+    <Switch id="switch_test" layout_width="match_parent" layout_height="32dp" text="Switch input" />
+    <TextView id="hint" layout_width="match_parent" layout_height="wrap_content" text="Move: cursor   Press: select" textSize="9sp" textColor="#A0A0A8" padding="2dp" />
+</LinearLayout>

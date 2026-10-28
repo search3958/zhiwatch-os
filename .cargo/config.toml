@@ -1,0 +1,9 @@
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+[target.riscv32imc-unknown-none-elf]
+runner = "espflash flash --before usb-reset --monitor"
+rustflags = ["-C", "link-arg=-Tlinkall.x"]
+
+[env]
+ESP_HAL_BUILD = "1"
