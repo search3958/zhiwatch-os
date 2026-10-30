@@ -2,9 +2,10 @@
 
 This adds a small bare-metal ESP32-C3 entry point that uses the existing `Warp4Engine`,
 reads a two-axis analog joystick with a push button, and streams the rendered
-135x240 UI to a PC over the ESP32-C3's native USB Serial/JTAG connection. The
-original ST7789 LCD output was removed because the panel was damaged; the PC
-viewer replaces it.
+135x240 UI to a PC over the ESP32-C3's native USB Serial/JTAG connection. The PC
+viewer can also send a virtual joystick back over the same link. The original
+ST7789 LCD output was removed because the panel was damaged; the PC viewer
+replaces it.
 
 ## Required workspace
 
@@ -74,6 +75,27 @@ payload_len u32 | crc32 u32
 `tools/zhiwatch_viewer.py` implements the receiving side (pure Python, tkinter +
 pyserial, no other dependencies). `--headless N` validates the stream without a
 GUI; `--smoke N` renders a synthetic frame offline.
+
+## Virtual joystick (host input)
+
+The GUI shows a virtual joystick next to the streamed frame. Drag the pad with
+the mouse (or a touchscreen that emits normal pointer events), or use the arrow
+keys; **Space** presses the joystick button. **P** pauses the display and
+**Q**/Escape quits. The virtual stick overrides the physical stick while it is
+deflected, and the physical button and Space are OR-ed together.
+
+The viewer sends this packet over the same USB serial connection:
+
+```
+magic "ZWI1" | version u8 | flags u8 | x i8 | y i8 | buttons u8
+```
+
+`x`/`y` are `-127..127` screen-space axes (right/down positive) and `buttons`
+bit0 is the push button. The viewer sends a heartbeat every 100 ms while the
+stick is deflected; firmware drops host input after 500 ms without a packet, so
+a closed viewer cannot leave the pointer stuck. Input is only applied when the
+host sends it, so using the viewer without the virtual stick behaves exactly as
+before.
 
 ## Joystick settings
 

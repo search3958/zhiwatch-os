@@ -37,6 +37,19 @@ const FRAME_FLAG_RLE: u16 = 1;
 // so the input loop keeps running when no viewer is attached.
 const USB_STALL_TIMEOUT_MS: u64 = 30;
 
+// Host -> device virtual joystick protocol (see tools/zhiwatch_viewer.py):
+// magic "ZWI1" | version u8 | flags u8 | x i8 | y i8 | buttons u8
+// x/y are -127..127 and buttons bit0 is the push button. The viewer sends a
+// heartbeat while the stick is deflected; drop the state if it stops.
+const INPUT_MAGIC: [u8; 4] = *b"ZWI1";
+const INPUT_VERSION: u8 = 1;
+const INPUT_PACKET_LEN: usize = 9;
+const INPUT_BUTTON: u8 = 1;
+const VIRTUAL_INPUT_TIMEOUT_MS: u64 = 500;
+// Match the physical stick's deadzone/fast-zone ratios (about 25% and 66%).
+const VIRTUAL_DEADZONE: i32 = 24;
+const VIRTUAL_FAST_ZONE: i32 = 84;
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
 // Set either to true if the physical joystick axis is reversed on your module.
@@ -122,8 +135,32 @@ fn main() -> ! {
     let mut previous_button_down = false;
     let mut x_adc_fault = false;
     let mut y_adc_fault = false;
+    let mut input_parser = InputParser::new();
+    let mut virtual_x = 0_i8;
+    let mut virtual_y = 0_i8;
+    let mut virtual_button = false;
+    let mut virtual_last_rx: Option<Instant> = None;
 
     loop {
+        // Drain host input every iteration; the viewer drives the same cursor
+        // as the physical stick and sends a heartbeat while it is held.
+        while let Ok(byte) = usb.read_byte() {
+            if let Some((x, y, button)) = input_parser.push(byte) {
+                virtual_x = x;
+                virtual_y = y;
+                virtual_button = button;
+                virtual_last_rx = Some(Instant::now());
+            }
+        }
+        if let Some(last_rx) = virtual_last_rx {
+            if last_rx.elapsed().as_millis() >= VIRTUAL_INPUT_TIMEOUT_MS {
+                virtual_x = 0;
+                virtual_y = 0;
+                virtual_button = false;
+                virtual_last_rx = None;
+            }
+        }
+
         let raw_x = match nb::block!(adc.read_oneshot(&mut joystick_x_pin)) {
             Ok(value) => {
                 if x_adc_fault {
@@ -161,6 +198,12 @@ fn main() -> ! {
         let mut dy = axis_step(raw_y);
         if JOYSTICK_X_REVERSED { dx = -dx; }
         if JOYSTICK_Y_REVERSED { dy = -dy; }
+        // The host already defines screen-space directions, so the physical
+        // axis-reversal switches do not apply to the virtual stick.
+        let virtual_dx = virtual_axis_step(virtual_x);
+        let virtual_dy = virtual_axis_step(virtual_y);
+        if virtual_dx != 0 { dx = virtual_dx; }
+        if virtual_dy != 0 { dy = virtual_dy; }
 
         let mut redraw = engine.tick(now_ns);
         if dx != 0 || dy != 0 {
@@ -171,7 +214,7 @@ fn main() -> ! {
         }
 
         // esp-hal's `Input::is_low()` is an inherent method returning `bool`.
-        let button_down = joystick_button.is_low();
+        let button_down = joystick_button.is_low() || virtual_button;
         if button_down && !previous_button_down {
             engine.click(cursor_x, cursor_y);
             esp_println::println!("[input] Joystick pressed at ({}, {})", cursor_x, cursor_y);
@@ -239,6 +282,64 @@ fn axis_step(raw: i32) -> i32 {
         delta.signum() * 3
     } else {
         delta.signum()
+    }
+}
+
+fn virtual_axis_step(raw: i8) -> i32 {
+    let delta = raw as i32;
+    let magnitude = delta.abs();
+    if magnitude < VIRTUAL_DEADZONE {
+        0
+    } else if magnitude >= VIRTUAL_FAST_ZONE {
+        delta.signum() * 3
+    } else {
+        delta.signum()
+    }
+}
+
+/// Incremental parser for host input packets. Non-magic bytes such as USB
+/// console input are discarded while the magic prefix is matched.
+struct InputParser {
+    buf: [u8; INPUT_PACKET_LEN],
+    len: usize,
+}
+
+impl InputParser {
+    fn new() -> Self {
+        Self {
+            buf: [0; INPUT_PACKET_LEN],
+            len: 0,
+        }
+    }
+
+    /// Returns `(x, y, button)` once a complete packet has been received.
+    fn push(&mut self, byte: u8) -> Option<(i8, i8, bool)> {
+        if self.len < INPUT_MAGIC.len() {
+            if byte == INPUT_MAGIC[self.len] {
+                self.buf[self.len] = byte;
+                self.len += 1;
+            } else if byte == INPUT_MAGIC[0] {
+                self.buf[0] = byte;
+                self.len = 1;
+            } else {
+                self.len = 0;
+            }
+            return None;
+        }
+        self.buf[self.len] = byte;
+        self.len += 1;
+        if self.len < INPUT_PACKET_LEN {
+            return None;
+        }
+        self.len = 0;
+        if self.buf[4] != INPUT_VERSION {
+            return None;
+        }
+        Some((
+            self.buf[6] as i8,
+            self.buf[7] as i8,
+            self.buf[8] & INPUT_BUTTON != 0,
+        ))
     }
 }
 
