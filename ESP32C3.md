@@ -99,9 +99,17 @@ before.
 
 ## Joystick settings
 
+The firmware measures each axis' resting ADC value at boot and uses that as its
+center, because the ESP32-C3 ADC range and the joystick's mechanical center are
+not guaranteed to be exactly mid-scale. Keep the stick centered while the board
+powers up; the calibrated values are printed as `[input] joystick center x=...
+y=...`. The center then follows slow drift while the stick is at rest, but is
+left fixed while the stick is deflected.
+
 The joystick deadzone, speed, and axis reversal are controlled by
 `JOYSTICK_DEADZONE`, `JOYSTICK_FAST_ZONE`, `JOYSTICK_X_REVERSED`, and
-`JOYSTICK_Y_REVERSED` near the top of `examples/esp32c3.rs`.
+`JOYSTICK_Y_REVERSED` near the top of `examples/esp32c3.rs`. Deadzone and fast
+zone are offsets from the calibrated center, not from 2048.
 
 ## Status / verification
 

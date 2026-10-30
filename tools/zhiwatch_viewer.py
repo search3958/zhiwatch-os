@@ -290,8 +290,18 @@ class VirtualInput:
     def press_key(self, keysym) -> bool:
         if keysym in AXIS_KEYS:
             self._cancel_release(keysym)
+            changed = False
+            # A keyboard direction always wins over a stale/failed pointer
+            # drag. Otherwise a missed mouse-release can leave the pad stuck
+            # at an edge and make the arrow keys appear to do nothing.
+            if self.pointer_active:
+                self.pointer_active = False
+                self.pointer = (0, 0)
+                changed = True
             if keysym not in self.held:
                 self.held.add(keysym)
+                changed = True
+            if changed:
                 self.publish(urgent=True)
             return True
         if keysym in SPACE_KEYS:
@@ -666,7 +676,9 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
     pad.bind("<ButtonRelease-1>", on_pad_release)
     press.bind("<ButtonPress-1>", on_press_down)
     press.bind("<ButtonRelease-1>", on_press_up)
-    root.bind("<ButtonRelease-1>", on_any_button_release)
+    # "all" catches the release even if it is delivered to another widget
+    # after a drag leaves the pad, which prevents a stuck pointer state.
+    root.bind_all("<ButtonRelease-1>", on_any_button_release)
     root.bind("<KeyPress>", on_key_press)
     root.bind("<KeyRelease>", on_key_release)
     root.bind("<FocusOut>", on_focus_out)

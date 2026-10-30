@@ -208,6 +208,12 @@ impl Warp4Engine {
             || (is_xiao() && self.scroll_subpixel != self.scroll_target_subpixel)
             || self.transition_elapsed_ns.is_some()
     }
+    /// True when the view tree or its visual state changed since the last
+    /// paint. Callers can use this to keep a cheap cursor overlay separate
+    /// from an expensive full-frame render.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
     pub fn window_damage(&self) -> Option<(i32, i32, i32, i32)> {
         None
     }

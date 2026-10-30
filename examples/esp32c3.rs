@@ -18,9 +18,22 @@ use esp_hal::{
 
 const LOGICAL_WIDTH: usize = 135;
 const LOGICAL_HEIGHT: usize = 240;
+// Fallback only; the real centers are measured at boot because the ADC's
+// zero/scale and the joystick's mechanical center are not guaranteed to be
+// exactly mid-scale on every board.
 const JOYSTICK_CENTER: i32 = 2048;
-const JOYSTICK_DEADZONE: i32 = 520;
-const JOYSTICK_FAST_ZONE: i32 = 1350;
+const JOYSTICK_DEADZONE: i32 = 300;
+const JOYSTICK_FAST_ZONE: i32 = 1200;
+const JOYSTICK_CAL_SAMPLES: usize = 16;
+const JOYSTICK_CAL_DELAY_MS: u32 = 8;
+const JOYSTICK_RECENTER_BAND: i32 = 80;
+const JOYSTICK_RECENTER_SHIFT: i32 = 4;
+// The cursor is a 5x5 plus sign. Its pixels are the only part of the layer
+// that changes while the UI is idle, so keep a tiny backing store for them
+// instead of repainting the whole view tree for every pointer step.
+const CURSOR_RADIUS: i32 = 2;
+const CURSOR_BOX: usize = (CURSOR_RADIUS * 2 + 1) as usize;
+const CURSOR_BACKING_LEN: usize = CURSOR_BOX * CURSOR_BOX;
 const LOOP_DELAY_MS: u32 = 20;
 const FRAME_TIME_NS: u64 = LOOP_DELAY_MS as u64 * 1_000_000;
 // USB full-speed CDC sustains well under 1.5 MB/s; with RLE payloads around
@@ -82,7 +95,7 @@ fn main() -> ! {
     esp_alloc::heap_allocator!(size: 256 * 1024);
     esp_println::println!("[ok] Heap allocator initialized (256 KiB)");
 
-    let mut delay = Delay::new();
+    let delay = Delay::new();
     let mut usb = UsbSerialJtag::new(peripherals.USB_DEVICE);
 
     let mut adc_config = AdcConfig::new();
@@ -92,6 +105,35 @@ fn main() -> ! {
     let joystick_button = Input::new(
         peripherals.GPIO20,
         InputConfig::default().with_pull(Pull::Up),
+    );
+
+    // Calibrate the resting position instead of assuming exactly mid-scale.
+    // The ESP32-C3 ADC's usable range and the module's mechanical center can
+    // both be offset, which otherwise makes a resting stick look permanently
+    // deflected (the reported "always drifts right" symptom).
+    let mut x_samples = [0_i32; JOYSTICK_CAL_SAMPLES];
+    let mut y_samples = [0_i32; JOYSTICK_CAL_SAMPLES];
+    for sample in 0..JOYSTICK_CAL_SAMPLES {
+        x_samples[sample] = match nb::block!(adc.read_oneshot(&mut joystick_x_pin)) {
+            Ok(value) => value as i32,
+            Err(_) => JOYSTICK_CENTER,
+        };
+        y_samples[sample] = match nb::block!(adc.read_oneshot(&mut joystick_y_pin)) {
+            Ok(value) => value as i32,
+            Err(_) => JOYSTICK_CENTER,
+        };
+        delay.delay_millis(JOYSTICK_CAL_DELAY_MS);
+    }
+    let mut joystick_center_x = median(&mut x_samples).clamp(256, 3840);
+    let mut joystick_center_y = median(&mut y_samples).clamp(256, 3840);
+    esp_println::println!(
+        "[input] joystick center x={} y={} (raw x {}..{}, y {}..{})",
+        joystick_center_x,
+        joystick_center_y,
+        x_samples[0],
+        x_samples[JOYSTICK_CAL_SAMPLES - 1],
+        y_samples[0],
+        y_samples[JOYSTICK_CAL_SAMPLES - 1]
     );
     esp_println::println!("[ok] Joystick ADC and push button initialized");
 
@@ -113,13 +155,14 @@ fn main() -> ! {
     let mut layer = LayerSystem::new(LOGICAL_WIDTH, LOGICAL_HEIGHT);
     let mut cursor_x = (LOGICAL_WIDTH / 2) as i32;
     let mut cursor_y = (LOGICAL_HEIGHT / 2) as i32;
+    let mut cursor_overlay = CursorOverlay::new();
     let _ = engine.set_hover_changed(cursor_x, cursor_y);
-    engine.draw_to_layer(&mut layer, 0, 0);
-    draw_cursor(&mut layer, cursor_x, cursor_y);
+    redraw_ui(&mut layer, &mut engine, &mut cursor_overlay, cursor_x, cursor_y);
 
     let mut seq = 0_u32;
     let mut last_frame_sent: Option<Instant> = None;
     let mut pending_send = true;
+    let mut cursor_dirty = false;
     let mut stream_active = false;
     if let Some(sent) = try_send(&mut usb, &layer, &mut seq, &mut last_frame_sent) {
         pending_send = !sent;
@@ -174,7 +217,7 @@ fn main() -> ! {
                     esp_println::println!("[error] Joystick X ADC read failed; using center value");
                     x_adc_fault = true;
                 }
-                JOYSTICK_CENTER
+                joystick_center_x
             }
         };
         let raw_y = match nb::block!(adc.read_oneshot(&mut joystick_y_pin)) {
@@ -190,12 +233,22 @@ fn main() -> ! {
                     esp_println::println!("[error] Joystick Y ADC read failed; using center value");
                     y_adc_fault = true;
                 }
-                JOYSTICK_CENTER
+                joystick_center_y
             }
         };
 
-        let mut dx = axis_step(raw_x);
-        let mut dy = axis_step(raw_y);
+        // Follow slow electrical/mechanical drift while the stick is at rest.
+        // Leave the center alone while it is deflected, otherwise holding a
+        // direction would gradually cancel itself out.
+        if !x_adc_fault {
+            joystick_center_x = recenter(joystick_center_x, raw_x);
+        }
+        if !y_adc_fault {
+            joystick_center_y = recenter(joystick_center_y, raw_y);
+        }
+
+        let mut dx = axis_step(raw_x, joystick_center_x);
+        let mut dy = axis_step(raw_y, joystick_center_y);
         if JOYSTICK_X_REVERSED { dx = -dx; }
         if JOYSTICK_Y_REVERSED { dy = -dy; }
         // The host already defines screen-space directions, so the physical
@@ -205,12 +258,17 @@ fn main() -> ! {
         if virtual_dx != 0 { dx = virtual_dx; }
         if virtual_dy != 0 { dy = virtual_dy; }
 
-        let mut redraw = engine.tick(now_ns);
+        engine.tick(now_ns);
+
         if dx != 0 || dy != 0 {
-            cursor_x = (cursor_x + dx).clamp(0, LOGICAL_WIDTH as i32 - 1);
-            cursor_y = (cursor_y + dy).clamp(0, LOGICAL_HEIGHT as i32 - 1);
-            let _ = engine.set_hover_changed(cursor_x, cursor_y);
-            redraw = true;
+            let next_x = (cursor_x + dx).clamp(0, LOGICAL_WIDTH as i32 - 1);
+            let next_y = (cursor_y + dy).clamp(0, LOGICAL_HEIGHT as i32 - 1);
+            if next_x != cursor_x || next_y != cursor_y {
+                cursor_x = next_x;
+                cursor_y = next_y;
+                let _ = engine.set_hover_changed(cursor_x, cursor_y);
+                cursor_dirty = true;
+            }
         }
 
         // esp-hal's `Input::is_low()` is an inherent method returning `bool`.
@@ -218,17 +276,29 @@ fn main() -> ! {
         if button_down && !previous_button_down {
             engine.click(cursor_x, cursor_y);
             esp_println::println!("[input] Joystick pressed at ({}, {})", cursor_x, cursor_y);
-            redraw = true;
         } else if !button_down && previous_button_down {
             engine.release();
-            redraw = true;
         }
         previous_button_down = button_down;
 
-        if redraw {
-            engine.draw_to_layer(&mut layer, 0, 0);
-            draw_cursor(&mut layer, cursor_x, cursor_y);
-            pending_send = true;
+        // Do not repaint faster than the USB link can carry frames. A full
+        // view repaint is only needed when the engine state changed; plain
+        // cursor motion just replaces the 5x5 cursor patch.
+        let frame_due = match last_frame_sent {
+            Some(sent_at) => sent_at.elapsed().as_millis() >= MIN_FRAME_INTERVAL_MS,
+            None => true,
+        };
+        if frame_due {
+            if engine.is_dirty() {
+                redraw_ui(&mut layer, &mut engine, &mut cursor_overlay, cursor_x, cursor_y);
+                cursor_dirty = false;
+                pending_send = true;
+            } else if cursor_dirty {
+                cursor_overlay.clear(&mut layer);
+                cursor_overlay.draw(&mut layer, cursor_x, cursor_y);
+                cursor_dirty = false;
+                pending_send = true;
+            }
         }
 
         if pending_send {
@@ -273,8 +343,8 @@ fn try_send(
     Some(ok)
 }
 
-fn axis_step(raw: i32) -> i32 {
-    let delta = raw - JOYSTICK_CENTER;
+fn axis_step(raw: i32, center: i32) -> i32 {
+    let delta = raw - center;
     let magnitude = delta.abs();
     if magnitude < JOYSTICK_DEADZONE {
         0
@@ -282,6 +352,28 @@ fn axis_step(raw: i32) -> i32 {
         delta.signum() * 3
     } else {
         delta.signum()
+    }
+}
+
+/// Median of the boot-time samples. The median rejects a single noisy sample
+/// (or a brief touch during power-up) better than a plain average.
+fn median(samples: &mut [i32]) -> i32 {
+    if samples.is_empty() {
+        return JOYSTICK_CENTER;
+    }
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+/// Follow slow center drift only while the stick is within a narrow band
+/// around the current center. Moving the stick cancels the update, so holding
+/// a direction cannot slowly re-center the stick and reduce its travel.
+fn recenter(center: i32, raw: i32) -> i32 {
+    let delta = raw - center;
+    if delta.abs() <= JOYSTICK_RECENTER_BAND {
+        center + delta / JOYSTICK_RECENTER_SHIFT
+    } else {
+        center
     }
 }
 
@@ -343,13 +435,93 @@ impl InputParser {
     }
 }
 
+type CursorRect = (usize, usize, usize, usize);
+
+/// Cursor pixels saved from the layer before the overlay was drawn. Restoring
+/// this 5x5 patch is enough to remove the cursor without keeping a second
+/// full-size framebuffer (which would not fit next to the 129 KiB layer).
+struct CursorOverlay {
+    rect: Option<CursorRect>,
+    backing: [u32; CURSOR_BACKING_LEN],
+}
+
+impl CursorOverlay {
+    fn new() -> Self {
+        Self {
+            rect: None,
+            backing: [0; CURSOR_BACKING_LEN],
+        }
+    }
+
+    /// Restore the pixels hidden by the cursor currently in the layer.
+    fn clear(&mut self, layer: &mut LayerSystem) {
+        let Some((x0, y0, x1, y1)) = self.rect.take() else {
+            return;
+        };
+        let width = x1 - x0;
+        let height = y1 - y0;
+        let buf = layer.buf_mut();
+        for row in 0..height {
+            let src = row * width;
+            let dst = (y0 + row) * LOGICAL_WIDTH + x0;
+            buf[dst..dst + width].copy_from_slice(&self.backing[src..src + width]);
+        }
+    }
+
+    /// Save the background under `(x, y)` and draw the cursor on top. Call
+    /// `clear` first so the saved pixels never include the previous cursor.
+    fn draw(&mut self, layer: &mut LayerSystem, x: i32, y: i32) {
+        let rect = cursor_footprint(x, y);
+        let (x0, y0, x1, y1) = rect;
+        let width = x1 - x0;
+        let height = y1 - y0;
+        {
+            let buf = layer.buf_ref();
+            for row in 0..height {
+                let src = (y0 + row) * LOGICAL_WIDTH + x0;
+                let dst = row * width;
+                self.backing[dst..dst + width].copy_from_slice(&buf[src..src + width]);
+            }
+        }
+        draw_cursor(layer, x, y);
+        self.rect = Some(rect);
+    }
+}
+
+fn cursor_footprint(x: i32, y: i32) -> CursorRect {
+    let x = x.clamp(0, LOGICAL_WIDTH as i32 - 1);
+    let y = y.clamp(0, LOGICAL_HEIGHT as i32 - 1);
+    let x0 = x.saturating_sub(CURSOR_RADIUS) as usize;
+    let y0 = y.saturating_sub(CURSOR_RADIUS) as usize;
+    // The drawing code keeps the full bar length at the edges (it clamps the
+    // start, not the end), so the save/restore rectangle must match that.
+    let x1 = (x0 + CURSOR_BOX).min(LOGICAL_WIDTH);
+    let y1 = (y0 + CURSOR_BOX).min(LOGICAL_HEIGHT);
+    (x0, y0, x1, y1)
+}
+
+/// Repaint the full view tree. The cursor is removed first so its old pixels
+/// cannot survive as part of the new background.
+fn redraw_ui(
+    layer: &mut LayerSystem,
+    engine: &mut Warp4Engine,
+    cursor: &mut CursorOverlay,
+    x: i32,
+    y: i32,
+) {
+    cursor.clear(layer);
+    engine.draw_to_layer(layer, 0, 0);
+    cursor.draw(layer, x, y);
+}
+
 fn draw_cursor(layer: &mut LayerSystem, x: i32, y: i32) {
     let x = x.clamp(0, LOGICAL_WIDTH as i32 - 1) as usize;
     let y = y.clamp(0, LOGICAL_HEIGHT as i32 - 1) as usize;
     let black = Color::rgb(0, 0, 0);
     let white = Color::rgb(255, 255, 255);
-    layer.fill_rect(x.saturating_sub(2), y, 5, 1, black);
-    layer.fill_rect(x, y.saturating_sub(2), 1, 5, black);
+    let radius = CURSOR_RADIUS as usize;
+    layer.fill_rect(x.saturating_sub(radius), y, CURSOR_BOX, 1, black);
+    layer.fill_rect(x, y.saturating_sub(radius), 1, CURSOR_BOX, black);
     layer.fill_rect(x.saturating_sub(1), y, 3, 1, white);
     layer.fill_rect(x, y.saturating_sub(1), 1, 3, white);
 }
