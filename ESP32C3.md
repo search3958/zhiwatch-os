@@ -62,33 +62,35 @@ magic "ZWF2" | width u16 | height u16 | flags u16 | seq u32 |
 payload_len u32 | crc32 u32
 ```
 
-* `flags` bit0: payload is RLE with entries `(run_count u8, color_hi u8, color_lo u8)`.
-  Otherwise the payload is raw `width*height` RGB565 samples (big-endian).
+* `flags` bit0: payload is RLE with entries `(run_count u8, sample u8)`.
+  Otherwise the payload is raw `width*height` 8-bit samples.
+* `flags` bit1: Chroma subcarrier modulation mode (Y luminance base with chroma C modulated on subcarrier).
+* `flags` bit2: 8-bit color mode (RGB332).
 * `crc32` is the standard CRC-32 of the payload bytes as transmitted.
-* RLE is chosen automatically per frame when it is smaller than raw; typical UI
-  frames compress to about 5.7 KiB (11x), which keeps ~10 fps on the ~220 KiB/s
-  link. Non-blocking writes with a 30 ms stall timeout keep the input loop alive
-  when no viewer is attached.
+* RLE is chosen automatically per frame when it is smaller than raw; 8-bit entries
+  cut transmission payload significantly, keeping higher FPS on the USB serial link.
 * Frames are sent only when the UI redraws, throttled to at most one per
   `MIN_FRAME_INTERVAL_MS` (66 ms).
 
 `tools/zhiwatch_viewer.py` implements the receiving side (pure Python, tkinter +
-pyserial, no other dependencies). `--headless N` validates the stream without a
-GUI; `--smoke N` renders a synthetic frame offline.
+pyserial, no other dependencies). Press **C** or click the **CHROMA CARRIER** button
+in the GUI to toggle the Y + chroma subcarrier mode dynamically.
 
 ## Virtual joystick (host input)
 
 The GUI shows a virtual joystick next to the streamed frame. Drag the pad with
 the mouse (or a touchscreen that emits normal pointer events), or use the arrow
-keys; **Space** presses the joystick button. **P** pauses the display and
-**Q**/Escape quits. The virtual stick overrides the physical stick while it is
-deflected, and the physical button and Space are OR-ed together.
+keys; **Space** presses the joystick button. **C** toggles Chroma Carrier mode,
+**P** pauses the display and **Q**/Escape quits. The virtual stick overrides the
+physical stick while it is deflected, and the physical button and Space are OR-ed together.
 
 The viewer sends this packet over the same USB serial connection:
 
 ```
 magic "ZWI1" | version u8 | flags u8 | x i8 | y i8 | buttons u8
 ```
+
+`flags` bit1 enables/disables Chroma subcarrier mode on the device.
 
 `x`/`y` are `-127..127` screen-space axes (right/down positive) and `buttons`
 bit0 is the push button. The viewer sends a heartbeat every 100 ms while the

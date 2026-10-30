@@ -35,6 +35,8 @@ MAGIC = b"ZWF2"
 # magic, w, h, flags, seq, payload_len, crc32
 HEADER = struct.Struct("<4sHHHIII")
 FLAG_RLE = 1
+FLAG_CHROMA_CARRIER = 2
+FLAG_8BIT = 4
 MAX_DIM = 4096
 
 # Host -> device input protocol (see examples/esp32c3.rs).
@@ -42,16 +44,102 @@ INPUT_MAGIC = b"ZWI1"
 INPUT_VERSION = 1
 INPUT_PACKET = struct.Struct("<4sBBbbB")
 INPUT_BUTTON = 1
+INPUT_FLAG_CHROMA_CARRIER = 2
 # Keep in sync with VIRTUAL_INPUT_TIMEOUT_MS in the ESP32-C3 example.
 INPUT_DEVICE_TIMEOUT_S = 0.5
 INPUT_HEARTBEAT_S = INPUT_DEVICE_TIMEOUT_S / 5
 INPUT_MIN_INTERVAL_S = 0.02
 
-# RGB565 -> RGB888 byte expansion tables (used via bytes.translate).
+# RGB565 -> RGB888 byte expansion tables (legacy fallback).
 _R = bytes((v & 0xF8) | (v >> 5) for v in range(256))
 _GH = bytes(((v & 0x07) << 5) for v in range(256))
 _GL = bytes((v >> 5) for v in range(256))
 _B = bytes(((v & 0x1F) << 3) | ((v & 0x1F) >> 2) for v in range(256))
+
+# RGB332 (8-bit color) -> RGB888 byte expansion tables.
+_R332 = bytes(((v >> 5) * 255 // 7) for v in range(256))
+_G332 = bytes((((v >> 2) & 7) * 255 // 7) for v in range(256))
+_B332 = bytes(((v & 3) * 255 // 3) for v in range(256))
+
+
+def rgb332_to_rgb(payload: bytes) -> bytes:
+    """Expand 8-bit RGB332 pixel buffer to RGB888."""
+    r = payload.translate(_R332)
+    g = payload.translate(_G332)
+    b = payload.translate(_B332)
+    rgb = bytearray(len(payload) * 3)
+    rgb[0::3] = r
+    rgb[1::3] = g
+    rgb[2::3] = b
+    return bytes(rgb)
+
+
+def chroma_carrier_decode(payload: bytes, w: int, h: int) -> bytes:
+    """Decode luminance Y modulated with chroma subcarrier (NTSC-style composite)."""
+    out = bytearray(w * h * 3)
+    # Pre-allocate row buffers for decoding
+    u_row = [0] * w
+    v_row = [0] * w
+    y_row = [0] * w
+
+    for y in range(h):
+        row_offset = y * w
+        line = payload[row_offset : row_offset + w]
+        line_len = len(line)
+        if line_len < w:
+            break
+        y_phase = (y & 1) * 2
+
+        # Comb-filter separation of Y and C (U/V)
+        # S[x] = Y[x] + C[x], where C has period 4 and anti-phase at distance 2.
+        for x in range(w):
+            s_curr = line[x]
+            s_next2 = line[min(x + 2, w - 1)]
+            s_prev2 = line[max(x - 2, 0)]
+            # Cancellation of chroma subcarrier by taking 2-pixel anti-phase average
+            y_val = (s_curr * 2 + s_prev2 + s_next2) >> 2
+            y_row[x] = y_val
+
+            # Subcarrier demodulation
+            phase = (x + y_phase) & 3
+            # Demodulate carrier amplitude
+            carrier_sample = (s_curr - s_next2) >> 1
+            if phase == 0:
+                u_row[x] = carrier_sample
+                v_row[x] = v_row[x - 1] if x > 0 else 0
+            elif phase == 1:
+                v_row[x] = carrier_sample
+                u_row[x] = u_row[x - 1] if x > 0 else 0
+            elif phase == 2:
+                u_row[x] = -carrier_sample
+                v_row[x] = v_row[x - 1] if x > 0 else 0
+            else:  # phase == 3
+                v_row[x] = -carrier_sample
+                u_row[x] = u_row[x - 1] if x > 0 else 0
+
+        # Horizontal low-pass chroma smoothing (narrow band reconstruction)
+        # Reconstruct RGB: Y + YUV matrix
+        out_idx = row_offset * 3
+        for x in range(w):
+            Y = y_row[x]
+            # Smooth chroma over neighboring samples
+            x_prev = max(x - 1, 0)
+            x_next = min(x + 1, w - 1)
+            U = (u_row[x_prev] + (u_row[x] << 1) + u_row[x_next]) >> 2
+            V = (v_row[x_prev] + (v_row[x] << 1) + v_row[x_next]) >> 2
+
+            # Matrix: R = Y + 1.402*V, G = Y - 0.344*U - 0.714*V, B = Y + 1.772*U
+            # Using integer scale * 256
+            r_val = Y + ((V * 359) >> 8)
+            g_val = Y - ((U * 88 + V * 183) >> 8)
+            b_val = Y + ((U * 454) >> 8)
+
+            out[out_idx] = max(0, min(255, r_val))
+            out[out_idx + 1] = max(0, min(255, g_val))
+            out[out_idx + 2] = max(0, min(255, b_val))
+            out_idx += 3
+
+    return bytes(out)
 
 
 def rgb565_to_rgb(payload: bytes) -> bytes:
@@ -65,6 +153,22 @@ def rgb565_to_rgb(payload: bytes) -> bytes:
     rgb[1::3] = g
     rgb[2::3] = b
     return bytes(rgb)
+
+
+def rle_decode_8bit(data: bytes) -> bytes:
+    """Decode entries of (run_count u8, color u8) to 8-bit stream."""
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i + 2 <= n:
+        count = data[i]
+        if count == 0:
+            raise ValueError("zero-length RLE run")
+        out += bytes((data[i + 1],)) * count
+        i += 2
+    if i != n:
+        raise ValueError("trailing RLE bytes")
+    return bytes(out)
 
 
 def rle_decode(data: bytes) -> bytes:
@@ -127,10 +231,13 @@ class FrameParser:
                 self.bad_headers += 1
                 self._flush_prefix(idx + 1)
                 continue
+            is_8bit = bool(flags & (FLAG_8BIT | FLAG_CHROMA_CARRIER))
             if flags & FLAG_RLE:
-                ok_len = 0 < plen <= pixels * 3
+                max_entry = 2 if is_8bit else 3
+                ok_len = 0 < plen <= pixels * max_entry
             else:
-                ok_len = plen == pixels * 2
+                expected_len = pixels if is_8bit else pixels * 2
+                ok_len = plen == expected_len
             if not ok_len:
                 self.bad_headers += 1
                 self._flush_prefix(idx + 1)
@@ -147,16 +254,26 @@ class FrameParser:
             self.payload_bytes += plen
             if flags & FLAG_RLE:
                 try:
-                    payload = rle_decode(payload)
+                    if is_8bit:
+                        payload = rle_decode_8bit(payload)
+                    else:
+                        payload = rle_decode(payload)
                 except ValueError:
                     self.bad_headers += 1
                     continue
-                if len(payload) != pixels * 2:
+                expected_len = pixels if is_8bit else pixels * 2
+                if len(payload) != expected_len:
                     self.bad_headers += 1
                     continue
             self.frames += 1
             self.seq = seq
-            self._pending = (w, h, rgb565_to_rgb(payload))
+            if flags & FLAG_CHROMA_CARRIER:
+                rgb_frame = chroma_carrier_decode(payload, w, h)
+            elif is_8bit:
+                rgb_frame = rgb332_to_rgb(payload)
+            else:
+                rgb_frame = rgb565_to_rgb(payload)
+            self._pending = (w, h, rgb_frame)
 
     def pull(self):
         frame, self._pending = self._pending, None
@@ -185,20 +302,26 @@ class InputLink:
 
     def __init__(self, ser):
         self.ser = ser
-        self.state = (0, 0, False)
+        self.state = (0, 0, False, 0)
         self.sent = None
         self.sent_at = 0.0
         self.last_error = None
+        self.flags = 0
+
+    def set_flags(self, flags: int):
+        self.flags = flags
+        x, y, btn, _ = self.state
+        self.state = (x, y, btn, self.flags)
 
     def set_state(self, x, y, button):
         x = max(-127, min(127, int(x)))
         y = max(-127, min(127, int(y)))
-        self.state = (x, y, bool(button))
+        self.state = (x, y, bool(button), self.flags)
 
     def send(self, force=False):
         now = time.monotonic()
-        x, y, button = self.state
-        active = x != 0 or y != 0 or button
+        x, y, button, flags = self.state
+        active = x != 0 or y != 0 or button or flags != 0
         changed = self.state != self.sent
         if not force:
             if not changed and not (active and now - self.sent_at >= INPUT_HEARTBEAT_S):
@@ -208,7 +331,7 @@ class InputLink:
         packet = INPUT_PACKET.pack(
             INPUT_MAGIC,
             INPUT_VERSION,
-            0,
+            flags,
             x,
             y,
             INPUT_BUTTON if button else 0,
@@ -514,9 +637,25 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
         center, 23, text="PRESS", fill=fg, font=("Menlo", 12, "bold")
     )
 
+    carrier_btn = tk.Canvas(
+        panel,
+        width=pad_size,
+        height=36,
+        bg=bg,
+        highlightthickness=0,
+        cursor="hand2",
+    )
+    carrier_btn.pack(pady=(4, 4))
+    carrier_box = carrier_btn.create_rectangle(
+        2, 2, pad_size - 2, 34, fill="#2C2C2E", outline="#8E8E93", width=1
+    )
+    carrier_text = carrier_btn.create_text(
+        center, 18, text="CHROMA CARRIER: OFF", fill=dim, font=("Menlo", 9, "bold")
+    )
+
     hint = tk.Label(
         panel,
-        text="Drag pad / arrow keys\nSpace: press\nP: pause  Q: quit",
+        text="Drag pad / arrow keys\nSpace: press  C: carrier\nP: pause  Q: quit",
         bg=bg,
         fg=dim,
         justify="left",
@@ -637,6 +776,21 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
         vinput.pointer_release()
         return "break"
 
+    chroma_carrier_on = {"val": False}
+
+    def toggle_chroma_carrier(event=None):
+        chroma_carrier_on["val"] = not chroma_carrier_on["val"]
+        active = chroma_carrier_on["val"]
+        link.set_flags(INPUT_FLAG_CHROMA_CARRIER if active else 0)
+        link.send(force=True)
+        carrier_btn.itemconfig(carrier_box, fill="#30D158" if active else "#2C2C2E")
+        carrier_btn.itemconfig(
+            carrier_text,
+            text="CHROMA CARRIER: ON" if active else "CHROMA CARRIER: OFF",
+            fill="#000000" if active else dim,
+        )
+        return "break"
+
     def on_press_down(event):
         vinput.press_button("mouse")
         return "break"
@@ -658,6 +812,9 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
             close()
         elif event.keysym in ("p", "P"):
             paused["on"] = not paused["on"]
+        elif event.keysym in ("c", "C"):
+            toggle_chroma_carrier()
+            return "break"
 
     def on_key_release(event):
         if vinput.release_key(event.keysym):
@@ -676,6 +833,7 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
     pad.bind("<ButtonRelease-1>", on_pad_release)
     press.bind("<ButtonPress-1>", on_press_down)
     press.bind("<ButtonRelease-1>", on_press_up)
+    carrier_btn.bind("<ButtonPress-1>", toggle_chroma_carrier)
     # "all" catches the release even if it is delivered to another widget
     # after a drag leaves the pad, which prevents a stuck pointer state.
     root.bind_all("<ButtonRelease-1>", on_any_button_release)

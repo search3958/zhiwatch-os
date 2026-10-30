@@ -40,12 +40,16 @@ const FRAME_TIME_NS: u64 = LOOP_DELAY_MS as u64 * 1_000_000;
 // 6 KiB this cap allows roughly 10-15 frames per second.
 const MIN_FRAME_INTERVAL_MS: u64 = 66;
 
-// Frame stream protocol (little-endian header, RGB565 big-endian payload):
+// Frame stream protocol (little-endian header, 8-bit payload):
 // magic "ZWF2" | width u16 | height u16 | flags u16 | seq u32 | payload_len u32 | crc32 u32
-// flags bit0: payload is RLE (entries: run_count u8, color_hi u8, color_lo u8)
+// flags bit0: payload is RLE (entries: run_count u8, color u8)
+// flags bit1: payload is chroma carrier modulated (Y luminance base + C subcarrier)
+// flags bit2: payload is 8-bit color (RGB332)
 const FRAME_MAGIC: [u8; 4] = *b"ZWF2";
 const FRAME_HEADER_LEN: usize = 22;
 const FRAME_FLAG_RLE: u16 = 1;
+const FRAME_FLAG_CHROMA_CARRIER: u16 = 2;
+const FRAME_FLAG_8BIT: u16 = 4;
 // Give up on a frame if the host stops draining the USB FIFO for this long,
 // so the input loop keeps running when no viewer is attached.
 const USB_STALL_TIMEOUT_MS: u64 = 30;
@@ -58,6 +62,7 @@ const INPUT_MAGIC: [u8; 4] = *b"ZWI1";
 const INPUT_VERSION: u8 = 1;
 const INPUT_PACKET_LEN: usize = 9;
 const INPUT_BUTTON: u8 = 1;
+const INPUT_FLAG_CHROMA_CARRIER: u8 = 2;
 const VIRTUAL_INPUT_TIMEOUT_MS: u64 = 500;
 // Match the physical stick's deadzone/fast-zone ratios (about 25% and 66%).
 const VIRTUAL_DEADZONE: i32 = 24;
@@ -153,22 +158,24 @@ fn main() -> ! {
     engine.update(LOGICAL_WIDTH as i32, LOGICAL_HEIGHT as i32);
 
     let mut layer = LayerSystem::new(LOGICAL_WIDTH, LOGICAL_HEIGHT);
+    let mut fb = alloc::vec![0_u8; LOGICAL_WIDTH * LOGICAL_HEIGHT];
     let mut cursor_x = (LOGICAL_WIDTH / 2) as i32;
     let mut cursor_y = (LOGICAL_HEIGHT / 2) as i32;
     let mut cursor_overlay = CursorOverlay::new();
+    let mut chroma_carrier_mode = false;
     let _ = engine.set_hover_changed(cursor_x, cursor_y);
-    redraw_ui(&mut layer, &mut engine, &mut cursor_overlay, cursor_x, cursor_y);
+    redraw_ui(&mut layer, &mut engine, &mut fb, &mut cursor_overlay, cursor_x, cursor_y, chroma_carrier_mode);
 
     let mut seq = 0_u32;
     let mut last_frame_sent: Option<Instant> = None;
     let mut pending_send = true;
     let mut cursor_dirty = false;
     let mut stream_active = false;
-    if let Some(sent) = try_send(&mut usb, &layer, &mut seq, &mut last_frame_sent) {
+    if let Some(sent) = try_send(&mut usb, &fb, &mut seq, &mut last_frame_sent, chroma_carrier_mode) {
         pending_send = !sent;
         stream_active = sent;
         if sent {
-            esp_println::println!("[ok] First frame streamed to USB");
+            esp_println::println!("[ok] First frame streamed to USB (8-bit color)");
         } else {
             esp_println::println!("[wait] No USB host draining yet; frames resume when the viewer opens");
         }
@@ -188,11 +195,22 @@ fn main() -> ! {
         // Drain host input every iteration; the viewer drives the same cursor
         // as the physical stick and sends a heartbeat while it is held.
         while let Ok(byte) = usb.read_byte() {
-            if let Some((x, y, button)) = input_parser.push(byte) {
+            if let Some((x, y, button, flags)) = input_parser.push(byte) {
                 virtual_x = x;
                 virtual_y = y;
                 virtual_button = button;
                 virtual_last_rx = Some(Instant::now());
+                let host_carrier = flags & INPUT_FLAG_CHROMA_CARRIER != 0;
+                if host_carrier != chroma_carrier_mode {
+                    chroma_carrier_mode = host_carrier;
+                    esp_println::println!(
+                        "[video] Chroma subcarrier mode {}",
+                        if chroma_carrier_mode { "ENABLED" } else { "DISABLED" }
+                    );
+                    render_layer_to_fb(&layer, &mut fb, chroma_carrier_mode);
+                    cursor_overlay.draw(&mut fb, cursor_x, cursor_y, chroma_carrier_mode);
+                    pending_send = true;
+                }
             }
         }
         if let Some(last_rx) = virtual_last_rx {
@@ -290,19 +308,19 @@ fn main() -> ! {
         };
         if frame_due {
             if engine.is_dirty() {
-                redraw_ui(&mut layer, &mut engine, &mut cursor_overlay, cursor_x, cursor_y);
+                redraw_ui(&mut layer, &mut engine, &mut fb, &mut cursor_overlay, cursor_x, cursor_y, chroma_carrier_mode);
                 cursor_dirty = false;
                 pending_send = true;
             } else if cursor_dirty {
-                cursor_overlay.clear(&mut layer);
-                cursor_overlay.draw(&mut layer, cursor_x, cursor_y);
+                cursor_overlay.clear(&mut fb);
+                cursor_overlay.draw(&mut fb, cursor_x, cursor_y, chroma_carrier_mode);
                 cursor_dirty = false;
                 pending_send = true;
             }
         }
 
         if pending_send {
-            match try_send(&mut usb, &layer, &mut seq, &mut last_frame_sent) {
+            match try_send(&mut usb, &fb, &mut seq, &mut last_frame_sent, chroma_carrier_mode) {
                 Some(sent) => {
                     pending_send = !sent;
                     if sent != stream_active {
@@ -328,9 +346,10 @@ fn main() -> ! {
 /// elapsed, `Some(sent)` once an attempt was actually made.
 fn try_send(
     usb: &mut UsbSerialJtag<'_, Blocking>,
-    layer: &LayerSystem,
+    fb: &[u8],
     seq: &mut u32,
     last_frame_sent: &mut Option<Instant>,
+    chroma_carrier: bool,
 ) -> Option<bool> {
     if let Some(sent_at) = *last_frame_sent {
         if sent_at.elapsed().as_millis() < MIN_FRAME_INTERVAL_MS {
@@ -338,7 +357,7 @@ fn try_send(
         }
     }
     *seq = seq.wrapping_add(1);
-    let ok = send_frame(usb, layer, *seq);
+    let ok = send_frame(usb, fb, *seq, chroma_carrier);
     *last_frame_sent = Some(Instant::now());
     Some(ok)
 }
@@ -404,8 +423,8 @@ impl InputParser {
         }
     }
 
-    /// Returns `(x, y, button)` once a complete packet has been received.
-    fn push(&mut self, byte: u8) -> Option<(i8, i8, bool)> {
+    /// Returns `(x, y, button, flags)` once a complete packet has been received.
+    fn push(&mut self, byte: u8) -> Option<(i8, i8, bool, u8)> {
         if self.len < INPUT_MAGIC.len() {
             if byte == INPUT_MAGIC[self.len] {
                 self.buf[self.len] = byte;
@@ -431,18 +450,18 @@ impl InputParser {
             self.buf[6] as i8,
             self.buf[7] as i8,
             self.buf[8] & INPUT_BUTTON != 0,
+            self.buf[5],
         ))
     }
 }
 
 type CursorRect = (usize, usize, usize, usize);
 
-/// Cursor pixels saved from the layer before the overlay was drawn. Restoring
-/// this 5x5 patch is enough to remove the cursor without keeping a second
-/// full-size framebuffer (which would not fit next to the 129 KiB layer).
+/// Cursor pixels saved from the 8-bit framebuffer before the overlay was drawn.
+/// Restoring this 5x5 patch is enough to remove the cursor without re-rendering.
 struct CursorOverlay {
     rect: Option<CursorRect>,
-    backing: [u32; CURSOR_BACKING_LEN],
+    backing: [u8; CURSOR_BACKING_LEN],
 }
 
 impl CursorOverlay {
@@ -453,37 +472,32 @@ impl CursorOverlay {
         }
     }
 
-    /// Restore the pixels hidden by the cursor currently in the layer.
-    fn clear(&mut self, layer: &mut LayerSystem) {
+    /// Restore the pixels hidden by the cursor currently in the framebuffer.
+    fn clear(&mut self, fb: &mut [u8]) {
         let Some((x0, y0, x1, y1)) = self.rect.take() else {
             return;
         };
         let width = x1 - x0;
         let height = y1 - y0;
-        let buf = layer.buf_mut();
         for row in 0..height {
             let src = row * width;
             let dst = (y0 + row) * LOGICAL_WIDTH + x0;
-            buf[dst..dst + width].copy_from_slice(&self.backing[src..src + width]);
+            fb[dst..dst + width].copy_from_slice(&self.backing[src..src + width]);
         }
     }
 
-    /// Save the background under `(x, y)` and draw the cursor on top. Call
-    /// `clear` first so the saved pixels never include the previous cursor.
-    fn draw(&mut self, layer: &mut LayerSystem, x: i32, y: i32) {
+    /// Save the background under `(x, y)` and draw the cursor on top.
+    fn draw(&mut self, fb: &mut [u8], x: i32, y: i32, chroma_carrier: bool) {
         let rect = cursor_footprint(x, y);
         let (x0, y0, x1, y1) = rect;
         let width = x1 - x0;
         let height = y1 - y0;
-        {
-            let buf = layer.buf_ref();
-            for row in 0..height {
-                let src = (y0 + row) * LOGICAL_WIDTH + x0;
-                let dst = row * width;
-                self.backing[dst..dst + width].copy_from_slice(&buf[src..src + width]);
-            }
+        for row in 0..height {
+            let src = (y0 + row) * LOGICAL_WIDTH + x0;
+            let dst = row * width;
+            self.backing[dst..dst + width].copy_from_slice(&fb[src..src + width]);
         }
-        draw_cursor(layer, x, y);
+        draw_cursor_8bit(fb, x, y, chroma_carrier);
         self.rect = Some(rect);
     }
 }
@@ -493,44 +507,108 @@ fn cursor_footprint(x: i32, y: i32) -> CursorRect {
     let y = y.clamp(0, LOGICAL_HEIGHT as i32 - 1);
     let x0 = x.saturating_sub(CURSOR_RADIUS) as usize;
     let y0 = y.saturating_sub(CURSOR_RADIUS) as usize;
-    // The drawing code keeps the full bar length at the edges (it clamps the
-    // start, not the end), so the save/restore rectangle must match that.
     let x1 = (x0 + CURSOR_BOX).min(LOGICAL_WIDTH);
     let y1 = (y0 + CURSOR_BOX).min(LOGICAL_HEIGHT);
     (x0, y0, x1, y1)
 }
 
-/// Repaint the full view tree. The cursor is removed first so its old pixels
-/// cannot survive as part of the new background.
+#[inline(always)]
+fn rgb_to_rgb332(r: u8, g: u8, b: u8) -> u8 {
+    (r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6)
+}
+
+#[inline(always)]
+fn rgb_to_chroma_carrier(r: u8, g: u8, b: u8, x: usize, y: usize) -> u8 {
+    let r_i = r as i32;
+    let g_i = g as i32;
+    let b_i = b as i32;
+    // Y: 0.299 R + 0.587 G + 0.114 B -> (77*R + 150*G + 29*B) >> 8
+    let y_val = (77 * r_i + 150 * g_i + 29 * b_i) >> 8;
+    // U: 0.492 (B - Y) -> ((b_i - y_val) * 126) >> 8
+    // V: 0.877 (R - Y) -> ((r_i - y_val) * 224) >> 8
+    let u_val = ((b_i - y_val) * 126) >> 8;
+    let v_val = ((r_i - y_val) * 224) >> 8;
+
+    let y_phase = (y & 1) * 2;
+    let phase = (x + y_phase) & 3;
+    let carrier = match phase {
+        0 => u_val,
+        1 => v_val,
+        2 => -u_val,
+        _ => -v_val,
+    };
+    (y_val + carrier).clamp(0, 255) as u8
+}
+
+fn render_layer_to_fb(layer: &LayerSystem, fb: &mut [u8], chroma_carrier: bool) {
+    let pixels = layer.buf_ref();
+    let total = LOGICAL_WIDTH * LOGICAL_HEIGHT;
+    if chroma_carrier {
+        for y in 0..LOGICAL_HEIGHT {
+            let row_off = y * LOGICAL_WIDTH;
+            for x in 0..LOGICAL_WIDTH {
+                let col = Color(pixels[row_off + x]);
+                fb[row_off + x] = rgb_to_chroma_carrier(col.r(), col.g(), col.b(), x, y);
+            }
+        }
+    } else {
+        for i in 0..total {
+            let col = Color(pixels[i]);
+            fb[i] = rgb_to_rgb332(col.r(), col.g(), col.b());
+        }
+    }
+}
+
+/// Repaint the full view tree and update the 8-bit framebuffer.
 fn redraw_ui(
     layer: &mut LayerSystem,
     engine: &mut Warp4Engine,
+    fb: &mut [u8],
     cursor: &mut CursorOverlay,
     x: i32,
     y: i32,
+    chroma_carrier: bool,
 ) {
-    cursor.clear(layer);
+    cursor.clear(fb);
     engine.draw_to_layer(layer, 0, 0);
-    cursor.draw(layer, x, y);
+    render_layer_to_fb(layer, fb, chroma_carrier);
+    cursor.draw(fb, x, y, chroma_carrier);
 }
 
-fn draw_cursor(layer: &mut LayerSystem, x: i32, y: i32) {
+fn draw_cursor_8bit(fb: &mut [u8], x: i32, y: i32, chroma_carrier: bool) {
     let x = x.clamp(0, LOGICAL_WIDTH as i32 - 1) as usize;
     let y = y.clamp(0, LOGICAL_HEIGHT as i32 - 1) as usize;
-    let black = Color::rgb(0, 0, 0);
-    let white = Color::rgb(255, 255, 255);
+    let (black, white) = if chroma_carrier {
+        (0_u8, 255_u8)
+    } else {
+        (rgb_to_rgb332(0, 0, 0), rgb_to_rgb332(255, 255, 255))
+    };
     let radius = CURSOR_RADIUS as usize;
-    layer.fill_rect(x.saturating_sub(radius), y, CURSOR_BOX, 1, black);
-    layer.fill_rect(x, y.saturating_sub(radius), 1, CURSOR_BOX, black);
-    layer.fill_rect(x.saturating_sub(1), y, 3, 1, white);
-    layer.fill_rect(x, y.saturating_sub(1), 1, 3, white);
-}
 
-fn rgb565_bytes(color: Color) -> [u8; 2] {
-    let rgb565 = ((color.r() as u16 & 0xF8) << 8)
-        | ((color.g() as u16 & 0xFC) << 3)
-        | (color.b() as u16 >> 3);
-    [(rgb565 >> 8) as u8, rgb565 as u8]
+    let x_start = x.saturating_sub(radius);
+    let x_end = (x_start + CURSOR_BOX).min(LOGICAL_WIDTH);
+    let row_off = y * LOGICAL_WIDTH;
+    for px in x_start..x_end {
+        fb[row_off + px] = black;
+    }
+
+    let y_start = y.saturating_sub(radius);
+    let y_end = (y_start + CURSOR_BOX).min(LOGICAL_HEIGHT);
+    for py in y_start..y_end {
+        fb[py * LOGICAL_WIDTH + x] = black;
+    }
+
+    let cx_start = x.saturating_sub(1);
+    let cx_end = (cx_start + 3).min(LOGICAL_WIDTH);
+    for px in cx_start..cx_end {
+        fb[row_off + px] = white;
+    }
+
+    let cy_start = y.saturating_sub(1);
+    let cy_end = (cy_start + 3).min(LOGICAL_HEIGHT);
+    for py in cy_start..cy_end {
+        fb[py * LOGICAL_WIDTH + x] = white;
+    }
 }
 
 fn crc32_byte(crc: u32, byte: u8) -> u32 {
@@ -581,17 +659,16 @@ fn flush_nb(usb: &mut UsbSerialJtag<'_, Blocking>, last_progress: &mut Instant) 
     }
 }
 
-/// Run-length encoder over RGB565 colors. Entries are `[run_count, hi, lo]`
-/// with `run_count` in 1..=255. The same encoder drives both the sizing pass
-/// (CRC/length only) and the streaming pass, so both produce identical bytes.
-struct RleEncoder {
-    color: Option<u16>,
+/// Run-length encoder over 8-bit color / modulated samples.
+/// Entries are `[run_count, sample]` with `run_count` in 1..=255.
+struct RleEncoder8 {
+    color: Option<u8>,
     run: u8,
     crc: u32,
     size: usize,
 }
 
-impl RleEncoder {
+impl RleEncoder8 {
     fn new() -> Self {
         Self {
             color: None,
@@ -601,7 +678,7 @@ impl RleEncoder {
         }
     }
 
-    fn push(&mut self, color: u16, emit: &mut impl FnMut(&[u8])) {
+    fn push(&mut self, color: u8, emit: &mut impl FnMut(&[u8])) {
         if self.color == Some(color) {
             if self.run == 255 {
                 self.emit_current(emit);
@@ -626,46 +703,44 @@ impl RleEncoder {
 
     fn emit_current(&mut self, emit: &mut impl FnMut(&[u8])) {
         let color = self.color.unwrap_or(0);
-        let bytes = [self.run, (color >> 8) as u8, color as u8];
+        let bytes = [self.run, color];
         for &b in &bytes {
             self.crc = crc32_byte(self.crc, b);
         }
-        self.size += 3;
+        self.size += 2;
         emit(&bytes);
         self.run = 0;
     }
 }
 
-fn send_frame(usb: &mut UsbSerialJtag<'_, Blocking>, layer: &LayerSystem, seq: u32) -> bool {
-    if layer.width() != LOGICAL_WIDTH || layer.height() != LOGICAL_HEIGHT {
-        return false;
-    }
-    let pixels = layer.buf_ref();
+fn send_frame(
+    usb: &mut UsbSerialJtag<'_, Blocking>,
+    fb: &[u8],
+    seq: u32,
+    chroma_carrier: bool,
+) -> bool {
     let pixel_count = LOGICAL_WIDTH * LOGICAL_HEIGHT;
-    if pixels.len() < pixel_count {
+    if fb.len() < pixel_count {
         return false;
     }
 
-    // Pass 1: RLE size and CRC. The raw encoding's length is known up front,
-    // so the raw CRC is only computed on the (rare) fallback path.
-    let raw_len = pixel_count * 2;
-    let mut rle = RleEncoder::new();
-    for &pixel in &pixels[..pixel_count] {
-        rle.push(u16::from_be_bytes(rgb565_bytes(Color(pixel))), &mut |_b: &[u8]| {});
+    let raw_len = pixel_count;
+    let mut rle = RleEncoder8::new();
+    for &sample in &fb[..pixel_count] {
+        rle.push(sample, &mut |_b: &[u8]| {});
     }
     rle.finish(&mut |_b: &[u8]| {});
 
     let use_rle = rle.size < raw_len;
+    let flags_base = FRAME_FLAG_8BIT | if chroma_carrier { FRAME_FLAG_CHROMA_CARRIER } else { 0 };
     let (flags, payload_len, crc) = if use_rle {
-        (FRAME_FLAG_RLE, rle.size, !rle.crc)
+        (flags_base | FRAME_FLAG_RLE, rle.size, !rle.crc)
     } else {
         let mut crc_raw = 0xFFFF_FFFF_u32;
-        for &pixel in &pixels[..pixel_count] {
-            let bytes = rgb565_bytes(Color(pixel));
-            crc_raw = crc32_byte(crc_raw, bytes[0]);
-            crc_raw = crc32_byte(crc_raw, bytes[1]);
+        for &sample in &fb[..pixel_count] {
+            crc_raw = crc32_byte(crc_raw, sample);
         }
-        (0, raw_len, !crc_raw)
+        (flags_base, raw_len, !crc_raw)
     };
 
     let mut header = [0_u8; FRAME_HEADER_LEN];
@@ -683,7 +758,7 @@ fn send_frame(usb: &mut UsbSerialJtag<'_, Blocking>, layer: &LayerSystem, seq: u
     }
 
     if use_rle {
-        let mut buf = [0_u8; 768];
+        let mut buf = [0_u8; 512];
         let mut pos = 0_usize;
         let mut ok = true;
         {
@@ -701,9 +776,9 @@ fn send_frame(usb: &mut UsbSerialJtag<'_, Blocking>, layer: &LayerSystem, seq: u
                 buf[pos..pos + bytes.len()].copy_from_slice(bytes);
                 pos += bytes.len();
             };
-            let mut rle = RleEncoder::new();
-            for &pixel in &pixels[..pixel_count] {
-                rle.push(u16::from_be_bytes(rgb565_bytes(Color(pixel))), &mut emit);
+            let mut rle = RleEncoder8::new();
+            for &sample in &fb[..pixel_count] {
+                rle.push(sample, &mut emit);
             }
             rle.finish(&mut emit);
         }
@@ -714,17 +789,10 @@ fn send_frame(usb: &mut UsbSerialJtag<'_, Blocking>, layer: &LayerSystem, seq: u
             return false;
         }
     } else {
-        let mut line = [0_u8; LOGICAL_WIDTH * 2];
         for y in 0..LOGICAL_HEIGHT {
             let row_start = y * LOGICAL_WIDTH;
-            let mut out = 0;
-            for x in 0..LOGICAL_WIDTH {
-                let bytes = rgb565_bytes(Color(pixels[row_start + x]));
-                line[out] = bytes[0];
-                line[out + 1] = bytes[1];
-                out += 2;
-            }
-            if !write_all_nb(usb, &line, &mut last_progress) {
+            let line = &fb[row_start..row_start + LOGICAL_WIDTH];
+            if !write_all_nb(usb, line, &mut last_progress) {
                 return false;
             }
         }
