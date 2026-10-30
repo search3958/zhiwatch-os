@@ -5,7 +5,7 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 use baram_core::{Color, LayerSystem};
-use baram_warp4::{set_ui_mode, set_ui_scale_percent, UiMode, Warp4Engine};
+use baram_warp4::{set_ui_mode, set_ui_scale_percent, set_xiao_size, UiMode, Warp4Engine};
 use esp_hal::{
     analog::adc::{Adc, AdcConfig, Attenuation},
     clock::CpuClock,
@@ -145,13 +145,15 @@ fn main() -> ! {
     baram_bsd::config::init_config();
     esp_println::println!("[ok] Config initialized");
 
-    set_ui_mode(UiMode::Xiao);
+    set_ui_mode(UiMode::Normal);
     set_ui_scale_percent(100);
+    set_xiao_size(true);
     let mut engine = Warp4Engine::new_embedded(
         "esp32c3-demo",
         &[
             ("config.ini", include_str!("esp32c3/config.ini")),
             ("main.w4u", include_str!("esp32c3/main.w4u")),
+            ("main.w4s", include_str!("esp32c3/main.w4s")),
         ],
     );
     engine.set_chrome_visible(false);

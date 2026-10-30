@@ -70,7 +70,7 @@ impl Warp4Engine {
             // does not specify a gap explicitly.
             let layout_gap = parse_dim(
                 self.nodes[idx].attr("layout_gap"),
-                if is_xiao() { ui_px(4) } else { ui_px(8) },
+                if is_xiao_size() { ui_px(4) } else { ui_px(8) },
             )
             .max(0);
             let visible_children = children
@@ -511,7 +511,7 @@ impl Warp4Engine {
 
     pub(crate) fn layout_grid(&mut self, idx: usize, pad: Edges) {
         let columns = parse_i32(self.nodes[idx].attr("columnCount")).max(1);
-        let gap = if is_xiao() { ui_px(4) } else { ui_px(8) };
+        let gap = if is_xiao_size() { ui_px(4) } else { ui_px(8) };
         let cell_w = ((self.nodes[idx].content_w - gap * (columns - 1)) / columns).max(1);
         let mut row_y = self.nodes[idx].y + pad.top;
         let mut row_h = 0;

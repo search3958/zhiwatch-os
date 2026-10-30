@@ -60,7 +60,7 @@ pub(crate) fn edges(n: &Node, base: &str) -> Edges {
         ),
         left: parse_dim(n.attr(&format!("{base}Left")), h),
     };
-    if is_xiao() && base == "padding" {
+    if is_xiao_size() && base == "padding" {
         // Xiao's compact profile keeps XML-owned button geometry while
         // reducing excess padding from legacy documents.
         edges.top = edges.top.min(ui_px(3));
@@ -74,7 +74,7 @@ pub(crate) fn edges(n: &Node, base: &str) -> Edges {
             edges.bottom = 3;
         }
     }
-    if is_xiao() && base == "layout_margin" {
+    if is_xiao_size() && base == "layout_margin" {
         edges.top = edges.top.min(ui_px(6));
         edges.bottom = edges.bottom.min(ui_px(4));
         edges.left = edges.left.min(ui_px(4));

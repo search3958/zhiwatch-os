@@ -663,7 +663,7 @@ impl Warp4Engine {
                         0
                     }
             };
-            let line_h = if is_xiao() && bdf_font::is_available() {
+            let line_h = if is_xiao_size() && bdf_font::is_available() {
                 // Misaki Gothic is an 8px bitmap font. Use its real line box
                 // for centering instead of the 25%-scaled nominal text size.
                 8

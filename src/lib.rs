@@ -43,8 +43,8 @@ use parser::{
     parse_script, set_attr, XmlParser,
 };
 use script::{bg, Action, Script};
-use ui::{is_xiao, palette, ui_px, ui_px_usize, ui_size};
-pub use ui::{set_ui_mode, set_ui_scale_percent, UiMode};
+use ui::{is_xiao, is_xiao_size, palette, ui_px, ui_px_usize, ui_size};
+pub use ui::{set_ui_mode, set_ui_scale_percent, set_xiao_size, UiMode};
 
 const MAX_NODES: usize = 2048;
 const MAX_ACTIONS: usize = 2048;

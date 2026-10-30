@@ -1,5 +1,5 @@
 use baram_core::Color;
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UiMode {
@@ -9,14 +9,24 @@ pub enum UiMode {
 
 static UI_MODE: AtomicU8 = AtomicU8::new(UiMode::Normal as u8);
 static UI_SCALE_PERCENT: AtomicU32 = AtomicU32::new(100);
+static UI_XIAO_SIZE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_ui_mode(mode: UiMode) {
     UI_MODE.store(mode as u8, Ordering::Relaxed);
 }
 
+pub fn set_xiao_size(enabled: bool) {
+    UI_XIAO_SIZE.store(enabled, Ordering::Relaxed);
+}
+
 #[inline]
 pub fn is_xiao() -> bool {
     UI_MODE.load(Ordering::Relaxed) == UiMode::Xiao as u8
+}
+
+#[inline]
+pub fn is_xiao_size() -> bool {
+    UI_XIAO_SIZE.load(Ordering::Relaxed) || is_xiao()
 }
 
 pub fn set_ui_scale_percent(percent: u32) {
