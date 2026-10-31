@@ -17,6 +17,21 @@ virtual joystick (and the keyboard) can drive the firmware's pointer:
 
 x/y are -127..127 joystick axes and buttons bit0 is the joystick push button.
 
+Viewer controls also use a one-shot command packet:
+
+    magic "ZWC1" | version u8 | command u8 | arg u8
+
+Commands restart the device, enable/disable the physical joystick, and request
+telemetry. The firmware replies with a telemetry packet:
+
+    magic "ZWT1" | version u8 | flags u8 | heap_used u32 | heap_total u32 |
+    flash_used u32 | flash_total u32 | uptime_ms u32
+
+The GUI shows heap (RAM) and flash usage, the physical-stick state, and uptime.
+The RESTART button (or R) sends a reboot command. The PHYSICAL STICK button
+(or J) disables/enables the board's real joystick axes and push button. The
+headless reporter prints the same telemetry values.
+
 Usage:
     tools/zhiwatch_viewer.py                     # GUI, auto port
     tools/zhiwatch_viewer.py --port /dev/tty.usbmodem101 --scale 3
@@ -49,6 +64,28 @@ INPUT_FLAG_CHROMA_CARRIER = 2
 INPUT_DEVICE_TIMEOUT_S = 0.5
 INPUT_HEARTBEAT_S = INPUT_DEVICE_TIMEOUT_S / 5
 INPUT_MIN_INTERVAL_S = 0.02
+# Retry interval after the USB serial device disappears (e.g. after a reboot).
+RECONNECT_INTERVAL_S = 0.5
+
+# Host -> device one-shot commands.
+COMMAND_MAGIC = b"ZWC1"
+COMMAND_VERSION = 1
+COMMAND_PACKET = struct.Struct("<4sBBB")
+COMMAND_REBOOT = 1
+COMMAND_SET_PHYSICAL_JOYSTICK = 2
+COMMAND_REQUEST_TELEMETRY = 3
+
+# Device -> host telemetry (sent once a second while frames are streaming).
+TELEMETRY_MAGIC = b"ZWT1"
+TELEMETRY_VERSION = 1
+TELEMETRY = struct.Struct("<4sBBIIIII")
+TELEMETRY_FLAG_PHYSICAL_JOYSTICK_DISABLED = 1
+
+
+def command_packet(command: int, arg: int = 0) -> bytes:
+    """Build a fixed-size host-to-device command packet."""
+    return COMMAND_PACKET.pack(COMMAND_MAGIC, COMMAND_VERSION, command, arg & 0xFF)
+
 
 # RGB565 -> RGB888 byte expansion tables (legacy fallback).
 _R = bytes((v & 0xF8) | (v >> 5) for v in range(256))
@@ -198,9 +235,19 @@ class FrameParser:
         self.payload_bytes = 0
         self.seq = None
         self.dropped_bytes = 0
+        self.telemetry = None  # newest (flags, heap_used, ... uptime_ms)
+        self.telemetry_packets = 0
         self.on_log = None  # callback(str) for non-frame bytes (firmware logs)
         self._pending = None  # newest (width, height, rgb) awaiting pull
         self._log_tail = b""
+
+    def reset_stream(self):
+        """Forget buffered bytes/state after the serial device reconnects."""
+        self.buf.clear()
+        self._pending = None
+        self._log_tail = b""
+        self.seq = None
+        self.telemetry = None
 
     def _flush_prefix(self, idx: int):
         if idx and self.on_log:
@@ -216,12 +263,48 @@ class FrameParser:
     def feed(self, data: bytes):
         self.buf.extend(data)
         while True:
-            idx = self.buf.find(MAGIC)
-            if idx < 0:
+            frame_idx = self.buf.find(MAGIC)
+            telemetry_idx = self.buf.find(TELEMETRY_MAGIC)
+            if frame_idx < 0 and telemetry_idx < 0:
                 # Keep a possible partial magic at the tail.
                 keep = max(len(self.buf) - (len(MAGIC) - 1), 0)
                 self._flush_prefix(keep)
                 return
+            if telemetry_idx >= 0 and (frame_idx < 0 or telemetry_idx < frame_idx):
+                if len(self.buf) < telemetry_idx + TELEMETRY.size:
+                    self._flush_prefix(telemetry_idx)
+                    return
+                (
+                    _magic,
+                    version,
+                    flags,
+                    heap_used,
+                    heap_total,
+                    flash_used,
+                    flash_total,
+                    uptime_ms,
+                ) = TELEMETRY.unpack_from(self.buf, telemetry_idx)
+                if (
+                    version != TELEMETRY_VERSION
+                    or heap_total == 0
+                    or heap_used > heap_total
+                ):
+                    self.bad_headers += 1
+                    self._flush_prefix(telemetry_idx + 1)
+                    continue
+                self._flush_prefix(telemetry_idx)
+                del self.buf[: TELEMETRY.size]
+                self.telemetry_packets += 1
+                self.telemetry = (
+                    flags,
+                    heap_used,
+                    heap_total,
+                    flash_used,
+                    flash_total,
+                    uptime_ms,
+                )
+                continue
+            idx = frame_idx
             if len(self.buf) < idx + HEADER.size:
                 self._flush_prefix(idx)
                 return
@@ -313,12 +396,38 @@ class InputLink:
         x, y, btn, _ = self.state
         self.state = (x, y, btn, self.flags)
 
+    def set_serial(self, ser):
+        """Point the link at a (re)opened port and resend the current state."""
+        self.ser = ser
+        self.sent = None
+        self.sent_at = 0.0
+        self.last_error = None
+
     def set_state(self, x, y, button):
         x = max(-127, min(127, int(x)))
         y = max(-127, min(127, int(y)))
         self.state = (x, y, bool(button), self.flags)
 
+    def send_command(self, command: int, arg: int = 0) -> bool:
+        """Send a one-shot command; returns False when the port is unavailable."""
+        if self.ser is None:
+            self.last_error = "serial port unavailable"
+            return False
+        packet = command_packet(command, arg)
+        try:
+            written = self.ser.write(packet)
+        except Exception as exc:  # port vanished / TX buffer full
+            self.last_error = str(exc)
+            return False
+        if written != len(packet):
+            self.last_error = "short command write"
+            return False
+        self.last_error = None
+        return True
+
     def send(self, force=False):
+        if self.ser is None:
+            return
         now = time.monotonic()
         x, y, button, flags = self.state
         active = x != 0 or y != 0 or button or flags != 0
@@ -503,15 +612,55 @@ def open_port(port: str, reset: bool):
     return ser
 
 
+def try_open_port(port: str):
+    """Open a port without resetting; return None while the device is absent."""
+    if not port:
+        return None
+    try:
+        import serial
+
+        return serial.Serial(port, 115_200, timeout=0.02, write_timeout=0)
+    except Exception:
+        return None
+
+
+def usage_text(used: int, total: int) -> str:
+    if total <= 0:
+        return "-- / --"
+    percent = used * 100.0 / total
+    if total >= 1 << 20:
+        return f"{used / (1 << 20):.2f}/{total / (1 << 20):.2f}M {percent:3.0f}%"
+    if total >= 1 << 10:
+        return f"{used / (1 << 10):.0f}/{total / (1 << 10):.0f}K {percent:3.0f}%"
+    return f"{used}/{total}B {percent:3.0f}%"
+
+
+def uptime_text(ms: int) -> str:
+    seconds = int(ms // 1000)
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
 def ppm_header(w: int, h: int) -> bytes:
     return f"P6\n{w} {h}\n255\n".encode()
 
 
 def run_headless(ser, parser: FrameParser, seconds: int, show_logs: bool):
     parser.on_log = (lambda text: sys.stdout.write(text)) if show_logs else None
+
+    def request_telemetry():
+        try:
+            ser.write(command_packet(COMMAND_REQUEST_TELEMETRY))
+        except Exception:
+            pass
+
+    request_telemetry()
+    next_request = time.time() + 1.0
     end = time.time() + seconds
     last_report = time.time()
-    last_seq = None
     while time.time() < end:
         data = ser.read(65536)
         if data:
@@ -519,12 +668,31 @@ def run_headless(ser, parser: FrameParser, seconds: int, show_logs: bool):
         if parser.pull():
             pass
         now = time.time()
+        if parser.telemetry is None and now >= next_request:
+            request_telemetry()
+            next_request = now + 1.0
         if now - last_report >= 1.0:
             last_report = now
             avg = parser.payload_bytes // max(parser.frames, 1)
+            if parser.telemetry is None:
+                telemetry = "telemetry=waiting"
+            else:
+                flags, heap_used, heap_total, flash_used, flash_total, uptime_ms = (
+                    parser.telemetry
+                )
+                stick = (
+                    "off"
+                    if flags & TELEMETRY_FLAG_PHYSICAL_JOYSTICK_DISABLED
+                    else "on"
+                )
+                telemetry = (
+                    f"heap={usage_text(heap_used, heap_total)} "
+                    f"flash={usage_text(flash_used, flash_total)} "
+                    f"stick={stick} up={uptime_text(uptime_ms)}"
+                )
             print(
                 f"frames={parser.frames} seq={parser.seq} crc_err={parser.crc_errors} "
-                f"bad_hdr={parser.bad_headers} avg_payload={avg}B",
+                f"bad_hdr={parser.bad_headers} avg_payload={avg}B {telemetry}",
                 flush=True,
             )
         if not data:
@@ -534,18 +702,21 @@ def run_headless(ser, parser: FrameParser, seconds: int, show_logs: bool):
     print(
         f"RESULT: frames={parser.frames} crc_errors={parser.crc_errors} "
         f"bad_headers={parser.bad_headers} last_seq={parser.seq} "
-        f"avg_payload={avg}B -> {'OK' if ok else 'FAIL'}"
+        f"avg_payload={avg}B telemetry={parser.telemetry_packets} "
+        f"-> {'OK' if ok else 'FAIL'}"
     )
     return 0 if ok else 1
 
 
-def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
+def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None, port=""):
     import tkinter as tk
+    from tkinter import messagebox
 
     parser.on_log = lambda text: log_tail.__setitem__(
         "text", (log_tail["text"] + text)[-300:]
     )
     log_tail = {"text": ""}
+    port = port or getattr(ser, "port", "")
 
     bg = "#1C1C1E"
     fg = "#F2F2F7"
@@ -575,7 +746,7 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
     panel.pack(side="right", fill="y")
 
     tk.Label(
-        panel, text="VIRTUAL JOYSTICK", bg=bg, fg=fg, font=("Menlo", 11, "bold")
+        panel, text="Magic Stick", bg=bg, fg=fg, font=("Menlo", 11, "bold")
     ).pack(anchor="w")
     pad = tk.Canvas(
         panel,
@@ -621,6 +792,16 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
     )
     value_label.pack(anchor="w")
 
+    usage_label = tk.Label(
+        panel,
+        text="RAM   -- / --\nFLASH -- / --\nUP    --",
+        bg=bg,
+        fg=dim,
+        justify="left",
+        font=("Menlo", 9),
+    )
+    usage_label.pack(anchor="w", pady=(6, 0))
+
     press = tk.Canvas(
         panel,
         width=pad_size,
@@ -653,9 +834,50 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
         center, 18, text="CHROMA CARRIER: OFF", fill=dim, font=("Menlo", 9, "bold")
     )
 
+    stick_btn = tk.Canvas(
+        panel,
+        width=pad_size,
+        height=36,
+        bg=bg,
+        highlightthickness=0,
+        cursor="hand2",
+    )
+    stick_btn.pack(pady=(0, 4))
+    stick_box = stick_btn.create_rectangle(
+        2, 2, pad_size - 2, 34, fill="#30D158", outline="#8E8E93", width=1
+    )
+    stick_text = stick_btn.create_text(
+        center,
+        18,
+        text="PHYSICAL STICK: ON",
+        fill="#000000",
+        font=("Menlo", 9, "bold"),
+    )
+
+    restart_btn = tk.Canvas(
+        panel,
+        width=pad_size,
+        height=36,
+        bg=bg,
+        highlightthickness=0,
+        cursor="hand2",
+    )
+    restart_btn.pack(pady=(0, 4))
+    restart_box = restart_btn.create_rectangle(
+        2, 2, pad_size - 2, 34, fill="#3A3A3C", outline="#FF453A", width=1
+    )
+    restart_text = restart_btn.create_text(
+        center, 18, text="RESTART", fill="#FF453A", font=("Menlo", 10, "bold")
+    )
+
     hint = tk.Label(
         panel,
-        text="Drag pad / arrow keys\nSpace: press  C: carrier\nP: pause  Q: quit",
+        text=(
+            "Drag pad / arrow keys\n"
+            "Space: press  C: carrier\n"
+            "J: physical stick  R: restart\n"
+            "P: pause  Q: quit"
+        ),
         bg=bg,
         fg=dim,
         justify="left",
@@ -673,6 +895,112 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
     paused = {"on": False}
 
     link = InputLink(ser)
+    serial_state = {"ser": ser, "port": port, "retry_at": 0.0}
+    notice = {"text": "", "until": 0.0}
+    telemetry_seen = {"value": None, "stick": True}
+    next_telemetry_request = {"at": 0.0}
+
+    def show_notice(text, seconds=3.0):
+        notice["text"] = text
+        notice["until"] = time.time() + seconds
+
+    def set_physical_joystick(enabled):
+        enabled = bool(enabled)
+        telemetry_seen["stick"] = enabled
+        stick_btn.itemconfig(stick_box, fill="#30D158" if enabled else "#3A3A3C")
+        stick_btn.itemconfig(
+            stick_text,
+            text="PHYSICAL STICK: ON" if enabled else "PHYSICAL STICK: OFF",
+            fill="#000000" if enabled else dim,
+        )
+
+    def toggle_physical_joystick(event=None):
+        enabled = not telemetry_seen["stick"]
+        if link.send_command(
+            COMMAND_SET_PHYSICAL_JOYSTICK, 1 if enabled else 0
+        ):
+            set_physical_joystick(enabled)
+            show_notice(
+                "physical stick enabled" if enabled else "physical stick disabled"
+            )
+        else:
+            show_notice(f"stick toggle failed: {link.last_error}")
+        return "break"
+
+    def apply_telemetry():
+        telemetry = parser.telemetry
+        if telemetry is None or telemetry == telemetry_seen["value"]:
+            return
+        telemetry_seen["value"] = telemetry
+        flags, heap_used, heap_total, flash_used, flash_total, uptime_ms = telemetry
+        usage_label.config(
+            text=(
+                f"RAM   {usage_text(heap_used, heap_total)}\n"
+                f"FLASH {usage_text(flash_used, flash_total)}\n"
+                f"UP    {uptime_text(uptime_ms)}"
+            )
+        )
+        enabled = not (flags & TELEMETRY_FLAG_PHYSICAL_JOYSTICK_DISABLED)
+        if enabled != telemetry_seen["stick"]:
+            set_physical_joystick(enabled)
+
+    def close_current_serial():
+        current = serial_state["ser"]
+        serial_state["ser"] = None
+        link.set_serial(None)
+        if current is not None:
+            try:
+                current.close()
+            except Exception:
+                pass
+
+    def attempt_reconnect(now):
+        if now < serial_state["retry_at"]:
+            return
+        serial_state["retry_at"] = now + RECONNECT_INTERVAL_S
+        target = serial_state["port"] or default_port()
+        new = try_open_port(target)
+        if new is None:
+            auto = default_port()
+            if auto and auto != target:
+                new = try_open_port(auto)
+                if new is not None:
+                    target = auto
+        if new is None:
+            return
+        serial_state["ser"] = new
+        serial_state["port"] = getattr(new, "port", None) or target
+        link.set_serial(new)
+        parser.reset_stream()
+        telemetry_seen["value"] = None
+        next_telemetry_request["at"] = 0.0
+        usage_label.config(text="RAM   -- / --\nFLASH -- / --\nUP    --")
+        link.send(force=True)
+        link.send_command(COMMAND_REQUEST_TELEMETRY)
+        show_notice(f"reconnected: {target}")
+
+    def restart_reconnect():
+        close_current_serial()
+        parser.reset_stream()
+        telemetry_seen["value"] = None
+        telemetry_seen["stick"] = True
+        next_telemetry_request["at"] = 0.0
+        usage_label.config(text="RAM   -- / --\nFLASH -- / --\nUP    --")
+        serial_state["retry_at"] = 0.0
+
+    def request_restart(event=None):
+        if not messagebox.askyesno(
+            "Restart device", "Restart the watch now? The video will pause briefly."
+        ):
+            return "break"
+        if not link.send_command(COMMAND_REBOOT):
+            show_notice(f"restart failed: {link.last_error}")
+            return "break"
+        show_notice("restarting device…", 5.0)
+        # The firmware resets after 20 ms and USB CDC disappears. Drop the
+        # stale handle so the poll loop can reconnect to the rebooted device.
+        root.after(400, restart_reconnect)
+        return "break"
 
     def on_input_change(x, y, button):
         kx = center + x / 127.0 * pad_radius
@@ -711,11 +1039,22 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
         stats["frames"] += 1
 
     def poll():
-        try:
-            data = ser.read(65536)
-        except Exception as exc:  # port vanished
-            status.config(text=f"serial error: {exc}")
-            return
+        now = time.time()
+        if serial_state["ser"] is None:
+            try:
+                attempt_reconnect(now)
+            except Exception as exc:  # never let reconnect stop the frame loop
+                show_notice(f"reconnect failed: {exc}", 2.0)
+
+        data = b""
+        current = serial_state["ser"]
+        if current is not None:
+            try:
+                data = current.read(65536)
+            except Exception as exc:  # port vanished / device rebooted
+                close_current_serial()
+                serial_state["retry_at"] = now + RECONNECT_INTERVAL_S
+                show_notice(f"serial lost: {exc}", 4.0)
         if data:
             parser.feed(data)
             # Render only the newest frame to stay latency-friendly.
@@ -727,6 +1066,15 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
                 frame = nxt
             if frame and not paused["on"]:
                 set_image(frame)
+
+        apply_telemetry()
+        if (
+            serial_state["ser"] is not None
+            and parser.telemetry is None
+            and now >= next_telemetry_request["at"]
+        ):
+            if link.send_command(COMMAND_REQUEST_TELEMETRY):
+                next_telemetry_request["at"] = now + 1.0
 
         # Resend the latest joystick state while it is deflected so the
         # firmware's host-input timeout cannot interrupt a long hold.
@@ -742,8 +1090,12 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
         extra = ""
         if paused["on"]:
             extra = "| PAUSED "
-        if link.last_error:
+        if serial_state["ser"] is None:
+            extra += "| reconnecting "
+        elif link.last_error:
             extra += f"| input err {link.last_error[:40]} "
+        if notice["text"] and now < notice["until"]:
+            extra += f"| {notice['text']} "
         status.config(
             text=(
                 f"fps {stats['fps']:.1f} | frames {stats['frames']} "
@@ -815,6 +1167,12 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
         elif event.keysym in ("c", "C"):
             toggle_chroma_carrier()
             return "break"
+        elif event.keysym in ("j", "J"):
+            toggle_physical_joystick()
+            return "break"
+        elif event.keysym in ("r", "R"):
+            request_restart()
+            return "break"
 
     def on_key_release(event):
         if vinput.release_key(event.keysym):
@@ -826,6 +1184,7 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
     def close():
         vinput.release_all()
         link.send(force=True)
+        close_current_serial()
         root.destroy()
 
     pad.bind("<ButtonPress-1>", on_pad_press)
@@ -834,6 +1193,8 @@ def run_gui(ser, parser: FrameParser, scale: int, title: str, duration=None):
     press.bind("<ButtonPress-1>", on_press_down)
     press.bind("<ButtonRelease-1>", on_press_up)
     carrier_btn.bind("<ButtonPress-1>", toggle_chroma_carrier)
+    stick_btn.bind("<ButtonPress-1>", toggle_physical_joystick)
+    restart_btn.bind("<ButtonPress-1>", request_restart)
     # "all" catches the release even if it is delivered to another widget
     # after a drag leaves the pad, which prevents a stuck pointer state.
     root.bind_all("<ButtonRelease-1>", on_any_button_release)
@@ -896,7 +1257,14 @@ def main():
     try:
         if args.headless:
             sys.exit(run_headless(ser, parser, args.headless, args.show_logs))
-        run_gui(ser, parser, max(args.scale, 1), f"ZhiWatch viewer — {args.port}", args.duration)
+        run_gui(
+            ser,
+            parser,
+            max(args.scale, 1),
+            f"ZhiWatch viewer — {args.port}",
+            args.duration,
+            port=args.port,
+        )
     finally:
         ser.close()
 

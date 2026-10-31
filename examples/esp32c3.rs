@@ -68,6 +68,30 @@ const VIRTUAL_INPUT_TIMEOUT_MS: u64 = 500;
 const VIRTUAL_DEADZONE: i32 = 24;
 const VIRTUAL_FAST_ZONE: i32 = 84;
 
+// Host -> device one-shot commands (viewer buttons / keys):
+// magic "ZWC1" | version u8 | command u8 | arg u8
+const COMMAND_MAGIC: [u8; 4] = *b"ZWC1";
+const COMMAND_VERSION: u8 = 1;
+const COMMAND_PACKET_LEN: usize = 7;
+const COMMAND_REBOOT: u8 = 1;
+const COMMAND_SET_PHYSICAL_JOYSTICK: u8 = 2;
+const COMMAND_REQUEST_TELEMETRY: u8 = 3;
+
+// Device -> host telemetry, sent once a second while the stream is active:
+// magic "ZWT1" | version u8 | flags u8 | heap_used u32 | heap_total u32 |
+// flash_used u32 | flash_total u32 | uptime_ms u32
+const TELEMETRY_MAGIC: [u8; 4] = *b"ZWT1";
+const TELEMETRY_VERSION: u8 = 1;
+const TELEMETRY_PACKET_LEN: usize = 26;
+const TELEMETRY_FLAG_PHYSICAL_JOYSTICK_DISABLED: u8 = 1;
+const TELEMETRY_INTERVAL_MS: u64 = 1000;
+
+// The app is flashed by espflash at the start of the factory partition. The
+// image header tells us how many bytes of that partition are actually used.
+const APP_IMAGE_OFFSET: u32 = 0x10_000;
+const APP_PARTITION_SIZE_FALLBACK: u32 = 0x30_0000;
+const APP_IMAGE_MAGIC: u8 = 0xE9;
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
 // Set either to true if the physical joystick axis is reversed on your module.
@@ -99,6 +123,22 @@ fn main() -> ! {
     // 129,600 bytes; the whole runtime plus renderer is kept in this bounded heap.
     esp_alloc::heap_allocator!(size: 256 * 1024);
     esp_println::println!("[ok] Heap allocator initialized (256 KiB)");
+
+    // Measure the flashed app image once at boot. The viewer displays this as
+    // flash usage; failures fall back to "unknown" instead of blocking boot.
+    let mut flash = esp_bootloader_esp_idf::partitions::FlashStorage::new(peripherals.FLASH);
+    let flash_total = flash.capacity() as u32;
+    let flash_used = read_app_image_size(
+        &mut flash,
+        APP_IMAGE_OFFSET,
+        APP_PARTITION_SIZE_FALLBACK,
+    )
+    .unwrap_or(0);
+    esp_println::println!(
+        "[ok] Flash usage {}/{} bytes",
+        flash_used,
+        flash_total
+    );
 
     let delay = Delay::new();
     let mut usb = UsbSerialJtag::new(peripherals.USB_DEVICE);
@@ -184,35 +224,63 @@ fn main() -> ! {
     }
 
     let mut now_ns = 0_u64;
+    let boot_instant = Instant::now();
     let mut previous_button_down = false;
     let mut x_adc_fault = false;
     let mut y_adc_fault = false;
-    let mut input_parser = InputParser::new();
+    let mut input_parser = HostParser::new();
     let mut virtual_x = 0_i8;
     let mut virtual_y = 0_i8;
     let mut virtual_button = false;
     let mut virtual_last_rx: Option<Instant> = None;
+    let mut physical_joystick_enabled = true;
+    let mut last_telemetry: Option<Instant> = None;
+    let mut telemetry_pending = false;
 
     loop {
         // Drain host input every iteration; the viewer drives the same cursor
         // as the physical stick and sends a heartbeat while it is held.
         while let Ok(byte) = usb.read_byte() {
-            if let Some((x, y, button, flags)) = input_parser.push(byte) {
-                virtual_x = x;
-                virtual_y = y;
-                virtual_button = button;
-                virtual_last_rx = Some(Instant::now());
-                let host_carrier = flags & INPUT_FLAG_CHROMA_CARRIER != 0;
-                if host_carrier != chroma_carrier_mode {
-                    chroma_carrier_mode = host_carrier;
-                    esp_println::println!(
-                        "[video] Chroma subcarrier mode {}",
-                        if chroma_carrier_mode { "ENABLED" } else { "DISABLED" }
-                    );
-                    render_layer_to_fb(&layer, &mut fb, chroma_carrier_mode);
-                    cursor_overlay.draw(&mut fb, cursor_x, cursor_y, chroma_carrier_mode);
-                    pending_send = true;
+            match input_parser.push(byte) {
+                Some(HostPacket::Input { x, y, button, flags }) => {
+                    virtual_x = x;
+                    virtual_y = y;
+                    virtual_button = button;
+                    virtual_last_rx = Some(Instant::now());
+                    let host_carrier = flags & INPUT_FLAG_CHROMA_CARRIER != 0;
+                    if host_carrier != chroma_carrier_mode {
+                        chroma_carrier_mode = host_carrier;
+                        esp_println::println!(
+                            "[video] Chroma subcarrier mode {}",
+                            if chroma_carrier_mode { "ENABLED" } else { "DISABLED" }
+                        );
+                        render_layer_to_fb(&layer, &mut fb, chroma_carrier_mode);
+                        cursor_overlay.draw(&mut fb, cursor_x, cursor_y, chroma_carrier_mode);
+                        pending_send = true;
+                    }
                 }
+                Some(HostPacket::Command { command, arg }) => match command {
+                    COMMAND_REBOOT => {
+                        esp_println::println!("[host] Reboot requested by viewer");
+                        // Give the USB FIFO a moment to drain before resetting.
+                        delay.delay_millis(20);
+                        esp_hal::system::software_reset();
+                    }
+                    COMMAND_SET_PHYSICAL_JOYSTICK => {
+                        let enabled = arg != 0;
+                        if enabled != physical_joystick_enabled {
+                            physical_joystick_enabled = enabled;
+                            esp_println::println!(
+                                "[input] Physical joystick {}",
+                                if enabled { "ENABLED" } else { "DISABLED" }
+                            );
+                            telemetry_pending = true;
+                        }
+                    }
+                    COMMAND_REQUEST_TELEMETRY => telemetry_pending = true,
+                    _ => {}
+                },
+                None => {}
             }
         }
         if let Some(last_rx) = virtual_last_rx {
@@ -224,51 +292,67 @@ fn main() -> ! {
             }
         }
 
-        let raw_x = match nb::block!(adc.read_oneshot(&mut joystick_x_pin)) {
-            Ok(value) => {
-                if x_adc_fault {
-                    esp_println::println!("[ok] Joystick X ADC recovered");
-                    x_adc_fault = false;
+        let raw_x = if physical_joystick_enabled {
+            match nb::block!(adc.read_oneshot(&mut joystick_x_pin)) {
+                Ok(value) => {
+                    if x_adc_fault {
+                        esp_println::println!("[ok] Joystick X ADC recovered");
+                        x_adc_fault = false;
+                    }
+                    value as i32
                 }
-                value as i32
-            }
-            Err(_) => {
-                if !x_adc_fault {
-                    esp_println::println!("[error] Joystick X ADC read failed; using center value");
-                    x_adc_fault = true;
+                Err(_) => {
+                    if !x_adc_fault {
+                        esp_println::println!("[error] Joystick X ADC read failed; using center value");
+                        x_adc_fault = true;
+                    }
+                    joystick_center_x
                 }
-                joystick_center_x
             }
+        } else {
+            joystick_center_x
         };
-        let raw_y = match nb::block!(adc.read_oneshot(&mut joystick_y_pin)) {
-            Ok(value) => {
-                if y_adc_fault {
-                    esp_println::println!("[ok] Joystick Y ADC recovered");
-                    y_adc_fault = false;
+        let raw_y = if physical_joystick_enabled {
+            match nb::block!(adc.read_oneshot(&mut joystick_y_pin)) {
+                Ok(value) => {
+                    if y_adc_fault {
+                        esp_println::println!("[ok] Joystick Y ADC recovered");
+                        y_adc_fault = false;
+                    }
+                    value as i32
                 }
-                value as i32
-            }
-            Err(_) => {
-                if !y_adc_fault {
-                    esp_println::println!("[error] Joystick Y ADC read failed; using center value");
-                    y_adc_fault = true;
+                Err(_) => {
+                    if !y_adc_fault {
+                        esp_println::println!("[error] Joystick Y ADC read failed; using center value");
+                        y_adc_fault = true;
+                    }
+                    joystick_center_y
                 }
-                joystick_center_y
             }
+        } else {
+            joystick_center_y
         };
 
         // Follow slow electrical/mechanical drift while the stick is at rest.
         // Leave the center alone while it is deflected, otherwise holding a
         // direction would gradually cancel itself out.
-        if !x_adc_fault {
+        if physical_joystick_enabled && !x_adc_fault {
             joystick_center_x = recenter(joystick_center_x, raw_x);
         }
-        if !y_adc_fault {
+        if physical_joystick_enabled && !y_adc_fault {
             joystick_center_y = recenter(joystick_center_y, raw_y);
         }
 
-        let mut dx = axis_step(raw_x, joystick_center_x);
-        let mut dy = axis_step(raw_y, joystick_center_y);
+        let mut dx = if physical_joystick_enabled {
+            axis_step(raw_x, joystick_center_x)
+        } else {
+            0
+        };
+        let mut dy = if physical_joystick_enabled {
+            axis_step(raw_y, joystick_center_y)
+        } else {
+            0
+        };
         if JOYSTICK_X_REVERSED { dx = -dx; }
         if JOYSTICK_Y_REVERSED { dy = -dy; }
         // The host already defines screen-space directions, so the physical
@@ -292,7 +376,8 @@ fn main() -> ! {
         }
 
         // esp-hal's `Input::is_low()` is an inherent method returning `bool`.
-        let button_down = joystick_button.is_low() || virtual_button;
+        let button_down = (physical_joystick_enabled && joystick_button.is_low())
+            || virtual_button;
         if button_down && !previous_button_down {
             engine.click(cursor_x, cursor_y);
             esp_println::println!("[input] Joystick pressed at ({}, {})", cursor_x, cursor_y);
@@ -337,6 +422,30 @@ fn main() -> ! {
                 // Throttled: keep the rendered frame and send it when due.
                 None => {}
             }
+        }
+
+        // Report heap/flash usage once a second while frames are flowing, and
+        // immediately after the viewer asks for it or toggles the physical
+        // joystick. Telemetry is tiny and never blocks frame rendering.
+        let telemetry_due = telemetry_pending
+            || (stream_active
+                && last_telemetry
+                    .map(|sent_at| sent_at.elapsed().as_millis() >= TELEMETRY_INTERVAL_MS)
+                    .unwrap_or(true));
+        if telemetry_due {
+            let heap = esp_alloc::HEAP.stats();
+            let uptime_ms = boot_instant.elapsed().as_millis() as u32;
+            send_telemetry(
+                &mut usb,
+                heap.current_usage as u32,
+                heap.size as u32,
+                flash_used,
+                flash_total,
+                uptime_ms,
+                physical_joystick_enabled,
+            );
+            last_telemetry = Some(Instant::now());
+            telemetry_pending = false;
         }
 
         delay.delay_millis(LOOP_DELAY_MS);
@@ -410,28 +519,69 @@ fn virtual_axis_step(raw: i8) -> i32 {
     }
 }
 
-/// Incremental parser for host input packets. Non-magic bytes such as USB
-/// console input are discarded while the magic prefix is matched.
-struct InputParser {
-    buf: [u8; INPUT_PACKET_LEN],
-    len: usize,
+/// A complete packet from the viewer. Input and command packets share the
+/// "ZW" prefix but have different lengths.
+enum HostPacket {
+    Input { x: i8, y: i8, button: bool, flags: u8 },
+    Command { command: u8, arg: u8 },
 }
 
-impl InputParser {
+#[derive(Clone, Copy, PartialEq)]
+enum PacketKind {
+    Input,
+    Command,
+}
+
+/// Incremental parser for both host input and command packets. Non-magic bytes
+/// such as USB console input are discarded while the magic prefix is matched.
+struct HostParser {
+    buf: [u8; INPUT_PACKET_LEN],
+    len: usize,
+    kind: PacketKind,
+}
+
+impl HostParser {
     fn new() -> Self {
         Self {
             buf: [0; INPUT_PACKET_LEN],
             len: 0,
+            kind: PacketKind::Input,
         }
     }
 
-    /// Returns `(x, y, button, flags)` once a complete packet has been received.
-    fn push(&mut self, byte: u8) -> Option<(i8, i8, bool, u8)> {
+    fn target_len(&self) -> usize {
+        match self.kind {
+            PacketKind::Input => INPUT_PACKET_LEN,
+            PacketKind::Command => COMMAND_PACKET_LEN,
+        }
+    }
+
+    fn push(&mut self, byte: u8) -> Option<HostPacket> {
+        // Match the shared "ZW?1" magic before reading the payload.
         if self.len < INPUT_MAGIC.len() {
-            if byte == INPUT_MAGIC[self.len] {
+            let matched = match self.len {
+                0 => byte == INPUT_MAGIC[0],
+                1 => byte == INPUT_MAGIC[1],
+                2 => {
+                    if byte == INPUT_MAGIC[2] {
+                        self.kind = PacketKind::Input;
+                        true
+                    } else if byte == COMMAND_MAGIC[2] {
+                        self.kind = PacketKind::Command;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => byte == INPUT_MAGIC[3] && byte == COMMAND_MAGIC[3],
+            };
+            if matched {
                 self.buf[self.len] = byte;
                 self.len += 1;
-            } else if byte == INPUT_MAGIC[0] {
+                return None;
+            }
+            self.kind = PacketKind::Input;
+            if byte == b'Z' {
                 self.buf[0] = byte;
                 self.len = 1;
             } else {
@@ -439,22 +589,100 @@ impl InputParser {
             }
             return None;
         }
+
         self.buf[self.len] = byte;
         self.len += 1;
-        if self.len < INPUT_PACKET_LEN {
+        if self.len < self.target_len() {
             return None;
         }
         self.len = 0;
-        if self.buf[4] != INPUT_VERSION {
+        let version = match self.kind {
+            PacketKind::Input => INPUT_VERSION,
+            PacketKind::Command => COMMAND_VERSION,
+        };
+        if self.buf[4] != version {
             return None;
         }
-        Some((
-            self.buf[6] as i8,
-            self.buf[7] as i8,
-            self.buf[8] & INPUT_BUTTON != 0,
-            self.buf[5],
-        ))
+        match self.kind {
+            PacketKind::Input => Some(HostPacket::Input {
+                x: self.buf[6] as i8,
+                y: self.buf[7] as i8,
+                button: self.buf[8] & INPUT_BUTTON != 0,
+                flags: self.buf[5],
+            }),
+            PacketKind::Command => Some(HostPacket::Command {
+                command: self.buf[5],
+                arg: self.buf[6],
+            }),
+        }
     }
+}
+
+/// Read the length of the ESP application image at `offset` by walking its
+/// segment table. Returns `None` for a blank or malformed image.
+fn read_app_image_size(
+    flash: &mut esp_bootloader_esp_idf::partitions::FlashStorage<'_>,
+    offset: u32,
+    max_size: u32,
+) -> Option<u32> {
+    let mut header = [0_u8; 24];
+    flash.read(offset, &mut header).ok()?;
+    if header[0] != APP_IMAGE_MAGIC {
+        return None;
+    }
+    let segments = header[1] as usize;
+    if segments == 0 || segments > 16 {
+        return None;
+    }
+    let mut len = header.len() as u32;
+    for _ in 0..segments {
+        let mut segment = [0_u8; 8];
+        flash.read(offset.checked_add(len)?, &mut segment).ok()?;
+        let data_len = u32::from_le_bytes([
+            segment[4],
+            segment[5],
+            segment[6],
+            segment[7],
+        ]);
+        len = len.checked_add(8)?.checked_add(data_len)?;
+        if len > max_size {
+            return None;
+        }
+    }
+    // The image has a checksum padded to 16 bytes and usually an appended
+    // SHA-256 digest; round up so the displayed size matches the flash image.
+    Some((((len + 15) & !15).checked_add(32)?).min(max_size))
+}
+
+/// Send a fixed-size telemetry packet. Failures (no host draining USB) are
+/// intentionally ignored; the next interval retries.
+fn send_telemetry(
+    usb: &mut UsbSerialJtag<'_, Blocking>,
+    heap_used: u32,
+    heap_total: u32,
+    flash_used: u32,
+    flash_total: u32,
+    uptime_ms: u32,
+    physical_joystick_enabled: bool,
+) -> bool {
+    let mut packet = [0_u8; TELEMETRY_PACKET_LEN];
+    packet[0..4].copy_from_slice(&TELEMETRY_MAGIC);
+    packet[4] = TELEMETRY_VERSION;
+    packet[5] = if physical_joystick_enabled {
+        0
+    } else {
+        TELEMETRY_FLAG_PHYSICAL_JOYSTICK_DISABLED
+    };
+    packet[6..10].copy_from_slice(&heap_used.to_le_bytes());
+    packet[10..14].copy_from_slice(&heap_total.to_le_bytes());
+    packet[14..18].copy_from_slice(&flash_used.to_le_bytes());
+    packet[18..22].copy_from_slice(&flash_total.to_le_bytes());
+    packet[22..26].copy_from_slice(&uptime_ms.to_le_bytes());
+    let mut last_progress = Instant::now();
+    if !write_all_nb(usb, &packet, &mut last_progress) {
+        return false;
+    }
+    flush_nb(usb, &mut last_progress)
 }
 
 type CursorRect = (usize, usize, usize, usize);

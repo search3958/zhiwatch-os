@@ -76,13 +76,24 @@ payload_len u32 | crc32 u32
 pyserial, no other dependencies). Press **C** or click the **CHROMA CARRIER** button
 in the GUI to toggle the Y + chroma subcarrier mode dynamically.
 
+## Viewer controls
+
+The side panel shows **RAM** (heap) and **FLASH** usage plus device **uptime**,
+updated from the telemetry packet described below. **J** or the **PHYSICAL
+STICK** button disables/enables the board's real joystick axes and push button;
+the virtual stick and Space keep working while it is disabled. **R** or the
+**RESTART** button asks for confirmation and reboots the board. The viewer then
+reconnects automatically when the USB device re-enumerates.
+
 ## Virtual joystick (host input)
 
 The GUI shows a virtual joystick next to the streamed frame. Drag the pad with
 the mouse (or a touchscreen that emits normal pointer events), or use the arrow
 keys; **Space** presses the joystick button. **C** toggles Chroma Carrier mode,
-**P** pauses the display and **Q**/Escape quits. The virtual stick overrides the
-physical stick while it is deflected, and the physical button and Space are OR-ed together.
+**J** toggles the physical stick, **R** restarts the device, **P** pauses the
+display and **Q**/Escape quits. The virtual stick overrides the physical stick
+while it is deflected, and the virtual button and physical button are OR-ed
+together (as long as the physical stick is enabled).
 
 The viewer sends this packet over the same USB serial connection:
 
@@ -98,6 +109,35 @@ stick is deflected; firmware drops host input after 500 ms without a packet, so
 a closed viewer cannot leave the pointer stuck. Input is only applied when the
 host sends it, so using the viewer without the virtual stick behaves exactly as
 before.
+
+## Commands and telemetry
+
+Viewer actions use a separate one-shot command packet:
+
+```
+magic "ZWC1" | version u8 | command u8 | arg u8
+```
+
+* `command` 1: reboot the device (`arg` ignored; firmware waits 20 ms for USB
+  to drain, then calls `software_reset`).
+* `command` 2: enable/disable the physical joystick (`arg` 0 = disabled,
+  non-zero = enabled). While disabled, the firmware skips both ADC reads and the
+  physical button; the virtual stick and button are unaffected.
+* `command` 3: send telemetry immediately.
+
+The device replies with:
+
+```
+magic "ZWT1" | version u8 | flags u8 | heap_used u32 | heap_total u32 |
+flash_used u32 | flash_total u32 | uptime_ms u32
+```
+
+`flags` bit0 means the physical joystick is disabled. `heap_used`/`heap_total`
+come from the `esp-alloc` heap. `flash_used` is the app image size computed from
+the image header at offset `0x10000`; `flash_total` is the flash chip capacity.
+Telemetry is sent immediately after a telemetry request or physical-stick change,
+and every second while frames are streaming. `tools/zhiwatch_viewer.py --headless`
+prints the same values.
 
 ## Joystick settings
 
