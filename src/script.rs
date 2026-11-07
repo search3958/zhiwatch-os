@@ -144,8 +144,10 @@ impl Warp4Engine {
             let current = self.state(target);
             self.set_state(target, &format!("{current}{suffix}"));
             self.dirty = true;
+            self.damage_all();
             return;
         }
+        let target_idx = self.find(target);
         let value = self.value(raw);
         match name {
             "var.set" | "var.edit" | "const.set" => self.set_state(target, &value),
@@ -269,6 +271,17 @@ impl Warp4Engine {
             _ => {}
         }
         self.dirty = true;
+        // Most WarpUI.* commands mutate a single target node in place (color,
+        // background, checked, progress, ...) and only its rectangle needs
+        // repainting. Text / visibility changes set layout_dirty and force a
+        // full rebuild; state-only or function calls are conservative.
+        if self.layout_dirty {
+            self.damage_all();
+        } else if let Some(idx) = target_idx {
+            self.damage_node(idx);
+        } else {
+            self.damage_all();
+        }
     }
 
     pub(crate) fn find(&self, id: &str) -> Option<usize> {

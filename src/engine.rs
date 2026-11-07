@@ -49,6 +49,9 @@ impl Warp4Engine {
             state: Vec::new(),
             focused: None,
             keyboard_focus: None,
+            focusable_nodes: Vec::with_capacity(MAX_NODES),
+            focus_positions: Vec::with_capacity(MAX_NODES),
+            focus_cache_valid: false,
             hovered: None,
             pressed: None,
             keyboard_press_until_ns: None,
@@ -68,13 +71,18 @@ impl Warp4Engine {
             last_command: None,
             dirty: true,
             layout_dirty: true,
+            damage_regions: [(0, 0, 0, 0); MAX_DAMAGE_REGIONS],
+            damage_count: 0,
+            damage_full: true,
             now_ns: 0,
             wait_until_ns: None,
             pending: Vec::new(),
             break_requested: false,
             flip_elapsed_ns: 0,
             last_tick_ns: None,
-            control_animations: Vec::new(),
+            control_animations: Vec::with_capacity(64),
+            last_animation_frame: None,
+            caret_phase: None,
             transition_elapsed_ns: None,
             last_clicked_id: None,
             runtime_fps: 0,
@@ -121,6 +129,7 @@ impl Warp4Engine {
             self.scroll_started_ns = None;
             self.dirty = true;
             self.layout_dirty = true;
+            self.damage_all();
         }
     }
     pub fn origin(&self) -> &str {
@@ -156,6 +165,7 @@ impl Warp4Engine {
                 }
                 self.hovered = None;
                 self.dirty = true;
+                self.damage_all();
             }
         } else if self.scroll != next {
             self.scroll = next;
@@ -170,6 +180,7 @@ impl Warp4Engine {
             }
             self.hovered = None;
             self.dirty = true;
+            self.damage_all();
         }
     }
 
@@ -214,11 +225,183 @@ impl Warp4Engine {
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
+    /// Mark the whole layer for repaint. Used whenever content moves (scroll,
+    /// layout, screen change) or when a script action may touch arbitrary
+    /// nodes, so a partial repaint cannot be trusted.
+    pub(crate) fn damage_all(&mut self) {
+        self.damage_full = true;
+        self.damage_count = 0;
+    }
+
+    /// Union a screen-space rectangle `(x, y, w, h)` into the damaged set.
+    /// Touching rectangles are coalesced; distant controls remain independent.
+    pub(crate) fn damage_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
+        if self.damage_full || w <= 0 || h <= 0 || self.width <= 0 || self.height <= 0 {
+            return;
+        }
+
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = x.saturating_add(w).min(self.width);
+        let y1 = y.saturating_add(h).min(self.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let mut merged = (x0, y0, x1 - x0, y1 - y0);
+
+        // Restart after every merge because the enlarged rectangle may now
+        // touch a region that was checked earlier.
+        let mut i = 0;
+        while i < self.damage_count {
+            let other = self.damage_regions[i];
+            let merged_right = merged.0.saturating_add(merged.2);
+            let merged_bottom = merged.1.saturating_add(merged.3);
+            let other_right = other.0.saturating_add(other.2);
+            let other_bottom = other.1.saturating_add(other.3);
+            let touches = merged.0 <= other_right
+                && merged_right >= other.0
+                && merged.1 <= other_bottom
+                && merged_bottom >= other.1;
+            if touches {
+                let nx = merged.0.min(other.0);
+                let ny = merged.1.min(other.1);
+                let nr = merged_right.max(other_right);
+                let nb = merged_bottom.max(other_bottom);
+                merged = (nx, ny, nr - nx, nb - ny);
+                self.damage_count -= 1;
+                self.damage_regions[i] = self.damage_regions[self.damage_count];
+                i = 0;
+            } else {
+                i += 1;
+            }
+        }
+
+        if self.damage_count == MAX_DAMAGE_REGIONS {
+            // A bounded fixed array avoids heap traffic during input. If an
+            // unusually complex frame exceeds it, a full repaint is safest.
+            self.damage_all();
+            return;
+        }
+        self.damage_regions[self.damage_count] = merged;
+        self.damage_count += 1;
+    }
+
+    /// Mark a single node's screen rectangle plus margins for focus rings and
+    /// antialiased edges.
+    pub(crate) fn damage_node(&mut self, idx: usize) {
+        if self.damage_full {
+            return;
+        }
+        let Some((x, y, w, h)) = self.nodes.get(idx).and_then(|node| {
+            node.visible().then_some((node.x, node.y, node.w, node.h))
+        }) else {
+            return;
+        };
+        let margin = 2;
+        let screen_y = self.node_screen_y(idx);
+        self.damage_rect(
+            x.saturating_sub(margin),
+            screen_y.saturating_sub(margin),
+            w.max(1).saturating_add(2 * margin),
+            h.max(1).saturating_add(2 * margin),
+        );
+    }
+
+    /// Bounding rectangle for legacy callers. Embedded rendering should use
+    /// `take_damage_rects` to preserve disjoint areas.
     pub fn window_damage(&self) -> Option<(i32, i32, i32, i32)> {
-        None
+        if self.damage_full || self.damage_count == 0 {
+            return None;
+        }
+        let first = self.damage_regions[0];
+        let mut x0 = first.0;
+        let mut y0 = first.1;
+        let mut x1 = first.0.saturating_add(first.2);
+        let mut y1 = first.1.saturating_add(first.3);
+        for rect in self.damage_regions.iter().take(self.damage_count).skip(1) {
+            x0 = x0.min(rect.0);
+            y0 = y0.min(rect.1);
+            x1 = x1.max(rect.0.saturating_add(rect.2));
+            y1 = y1.max(rect.1.saturating_add(rect.3));
+        }
+        Some((x0, y0, x1 - x0, y1 - y0))
+    }
+
+    /// Copy and clear independent damaged rectangles. `None` means a full
+    /// repaint is required; `Some(0)` means no pixels need repainting.
+    pub fn take_damage_rects(
+        &mut self,
+        output: &mut [(i32, i32, i32, i32)],
+    ) -> Option<usize> {
+        if self.damage_full {
+            self.damage_full = false;
+            self.damage_count = 0;
+            return None;
+        }
+        if self.damage_count > output.len() {
+            self.damage_full = true;
+            self.damage_count = 0;
+            return None;
+        }
+        let count = self.damage_count;
+        output[..count].copy_from_slice(&self.damage_regions[..count]);
+        self.damage_count = 0;
+        Some(count)
+    }
+
+    /// Compatibility helper for band-based clients that only track rows.
+    pub fn take_damage_rows(&mut self) -> Option<(i32, i32)> {
+        let mut rects = [(0, 0, 0, 0); MAX_DAMAGE_REGIONS];
+        let count = self.take_damage_rects(&mut rects)?;
+        if count == 0 {
+            return None;
+        }
+        let mut y0 = rects[0].1;
+        let mut y1 = y0.saturating_add(rects[0].3);
+        for rect in rects.iter().take(count).skip(1) {
+            y0 = y0.min(rect.1);
+            y1 = y1.max(rect.1.saturating_add(rect.3));
+        }
+        Some((y0, y1))
+    }
+
+    pub fn clear_damage(&mut self) {
+        self.damage_full = false;
+        self.damage_count = 0;
     }
     pub fn has_focused_input(&self) -> bool {
         self.focused.is_some()
+    }
+
+    /// Rebuild the compact focus candidate list after layout/visibility
+    /// changes. Navigation itself then performs no heap allocation and skips
+    /// non-interactive nodes entirely.
+    pub(crate) fn rebuild_focusable_nodes(&mut self) {
+        self.focusable_nodes.clear();
+        self.focus_positions.clear();
+        self.focus_positions.resize(self.nodes.len(), usize::MAX);
+        self.focus_cache_valid = true;
+        for idx in 0..self.nodes.len() {
+            let eligible = {
+                let node = &self.nodes[idx];
+                node.visible() && self.active_child(idx) && is_keyboard_focusable(node)
+            };
+            if eligible {
+                self.focus_positions[idx] = self.focusable_nodes.len();
+                self.focusable_nodes.push(idx);
+            }
+        }
+    }
+
+    /// Synchronize focus candidates before input consumes them. This path is
+    /// normally a no-op; it only lays out when a visibility/tree mutation is
+    /// pending, preventing one-frame navigation through stale controls.
+    pub(crate) fn ensure_focus_cache(&mut self) {
+        if self.layout_dirty && self.width > 0 && self.height > 0 {
+            self.update(self.width, self.height);
+        } else if !self.focus_cache_valid {
+            self.rebuild_focusable_nodes();
+        }
     }
 
     /// Move keyboard focus between interactive controls without requiring
@@ -226,23 +409,18 @@ impl Warp4Engine {
     /// arrows are intentionally used here by Xiao; vertical arrows remain
     /// document scrolling keys.
     pub fn focus_direction(&mut self, direction: i32) -> bool {
-        if self.nodes.is_empty() {
-            return false;
-        }
-        let mut focusable = Vec::new();
-        for idx in 0..self.nodes.len() {
-            let node = &self.nodes[idx];
-            if node.visible() && self.active_child(idx) && is_keyboard_focusable(node) {
-                focusable.push(idx);
-            }
-        }
+        self.ensure_focus_cache();
+        let focusable = &self.focusable_nodes;
         if focusable.is_empty() {
             return false;
         }
-        let next = match self
-            .keyboard_focus
-            .and_then(|current| focusable.iter().position(|idx| *idx == current))
-        {
+        let current_position = self.keyboard_focus.and_then(|current| {
+            self.focus_positions
+                .get(current)
+                .copied()
+                .filter(|position| *position != usize::MAX)
+        });
+        let next = match current_position {
             Some(position) => {
                 let next = position as i32 + if direction < 0 { -1 } else { 1 };
                 if next < 0 {
@@ -255,15 +433,30 @@ impl Warp4Engine {
             None => focusable[0],
         };
         let changed = self.keyboard_focus != Some(next);
+        let old_focus = self.keyboard_focus;
+        let previous_scroll = if is_xiao() {
+            self.scroll_target_subpixel
+        } else {
+            self.scroll_target
+        };
         self.keyboard_focus = Some(next);
         self.ensure_keyboard_focus_visible(next);
-        self.dirty = true;
-        changed
-            || if is_xiao() {
-                self.scroll_subpixel != self.scroll_target_subpixel
-            } else {
-                self.scroll != self.scroll_target
+        let scrolled = if is_xiao() {
+            self.scroll_target_subpixel != previous_scroll
+        } else {
+            self.scroll_target != previous_scroll
+        };
+        if changed {
+            if let Some(idx) = old_focus {
+                self.damage_node(idx);
             }
+            self.damage_node(next);
+        }
+        let moved = changed || scrolled;
+        if moved {
+            self.dirty = true;
+        }
+        moved
     }
 
     /// Screen rectangle (x, y, w, h) of the keyboard-focused control.
@@ -283,23 +476,31 @@ impl Warp4Engine {
         if dx == 0 && dy == 0 {
             return false;
         }
+        self.ensure_focus_cache();
         let Some(current) = self.keyboard_focus else {
             return self.focus_direction(if dx < 0 || dy < 0 { -1 } else { 1 });
         };
+        if self
+            .focus_positions
+            .get(current)
+            .copied()
+            .unwrap_or(usize::MAX)
+            == usize::MAX
+        {
+            self.keyboard_focus = None;
+            return self.focus_direction(if dx < 0 || dy < 0 { -1 } else { 1 });
+        }
         let Some((cx, cy, cw, ch)) = self.keyboard_focus_rect() else {
             return false;
         };
         // Doubled centers keep everything in integers.
         let (ccx, ccy) = (cx as i64 * 2 + cw as i64, cy as i64 * 2 + ch as i64);
         let mut best: Option<(i64, usize)> = None;
-        for idx in 0..self.nodes.len() {
+        for &idx in &self.focusable_nodes {
             if idx == current {
                 continue;
             }
             let node = &self.nodes[idx];
-            if !(node.visible() && self.active_child(idx) && is_keyboard_focusable(node)) {
-                continue;
-            }
             let ex = node.x as i64 * 2 + node.w.max(1) as i64;
             let ey = self.node_screen_y(idx) as i64 * 2 + node.h.max(1) as i64;
             let vx = ex - ccx;
@@ -320,8 +521,10 @@ impl Warp4Engine {
         let Some((_, next)) = best else {
             return false;
         };
+        self.damage_node(current);
         self.keyboard_focus = Some(next);
         self.ensure_keyboard_focus_visible(next);
+        self.damage_node(next);
         self.dirty = true;
         true
     }
@@ -329,13 +532,20 @@ impl Warp4Engine {
     /// Activate the currently focused button as if Space had clicked it.
     /// Text fields are left to the normal text-input path.
     pub fn activate_focused(&mut self) -> bool {
+        self.ensure_focus_cache();
         let Some(idx) = self.keyboard_focus else {
             return false;
         };
-        if !self
-            .nodes
+        if self
+            .focus_positions
             .get(idx)
-            .is_some_and(|node| is_keyboard_focusable(node) && !is_text_input(node))
+            .copied()
+            .unwrap_or(usize::MAX)
+            == usize::MAX
+            || !self
+                .nodes
+                .get(idx)
+                .is_some_and(|node| is_keyboard_focusable(node) && !is_text_input(node))
         {
             return false;
         }
@@ -351,6 +561,7 @@ impl Warp4Engine {
         if is_xiao() {
             self.transition_elapsed_ns = Some(0);
             self.dirty = true;
+            self.damage_all();
         }
     }
     pub fn set_runtime_metrics(&mut self, fps: u32, windows: usize, keys: u32, mouse: u32) {
@@ -363,12 +574,14 @@ impl Warp4Engine {
         self.hovered
     }
     pub fn clear_hover(&mut self) {
-        if self.hovered.take().is_some() {
+        if let Some(idx) = self.hovered.take() {
+            self.damage_node(idx);
             self.dirty = true;
         }
     }
     pub fn refresh_config(&mut self) {
         self.dirty = true;
+        self.damage_all();
     }
     pub fn take_command(&mut self) -> Option<String> {
         self.last_command.take()
@@ -385,13 +598,23 @@ impl Warp4Engine {
             .unwrap_or(0);
         self.flip_elapsed_ns = self.flip_elapsed_ns.saturating_add(delta);
 
+        const ANIMATION_FRAME_NS: u64 = 8_000_000;
+        let animation_frame = now_ns / ANIMATION_FRAME_NS;
+        let animation_frame_due = self.last_animation_frame != Some(animation_frame);
+        if animation_frame_due {
+            self.last_animation_frame = Some(animation_frame);
+        }
+
         let mut changed = false;
         let mut transition_finished = false;
         if let Some(elapsed) = self.transition_elapsed_ns.as_mut() {
             *elapsed = elapsed.saturating_add(delta.max(1_000_000));
             transition_finished = *elapsed >= XIAO_TRANSITION_NS;
-            changed = true;
-            self.dirty = true;
+            if animation_frame_due || transition_finished {
+                changed = true;
+                self.dirty = true;
+                self.damage_all();
+            }
         }
         if transition_finished {
             self.transition_elapsed_ns = None;
@@ -424,6 +647,7 @@ impl Warp4Engine {
                 self.scroll_subpixel = next_subpixel;
                 self.scroll = next_subpixel.div_euclid(3);
                 self.dirty = true;
+                self.damage_all();
                 changed = true;
             }
             if t >= 1.0 {
@@ -457,9 +681,12 @@ impl Warp4Engine {
                     let next =
                         (parse_i32(self.nodes[idx].attr("displayedChild")).max(0) + 1) % count;
                     set_attr(&mut self.nodes[idx], "displayedChild", &next.to_string());
+                    self.rebuild_focusable_nodes();
+                    self.layout_dirty = true;
                     self.hovered = None;
                     self.pressed = None;
                     self.dirty = true;
+                    self.damage_all();
                     changed = true;
                 }
             }
@@ -471,6 +698,7 @@ impl Warp4Engine {
                 if !self.pending.is_empty() {
                     let pending = core::mem::take(&mut self.pending);
                     self.execute(&pending);
+                    self.damage_all();
                     changed = true;
                 }
             }
@@ -478,37 +706,65 @@ impl Warp4Engine {
         if let Some(until) = self.keyboard_press_until_ns {
             if now_ns >= until {
                 self.keyboard_press_until_ns = None;
-                self.pressed = None;
+                if let Some(idx) = self.pressed.take() {
+                    self.damage_node(idx);
+                }
                 self.dirty = true;
                 changed = true;
             }
         }
-        let mut controls_animating = false;
-        self.control_animations.retain(|animation| {
-            let active = now_ns.saturating_sub(animation.started_ns) < animation.duration_ns;
-            controls_animating |= active;
-            active
-        });
-        if controls_animating {
-            self.dirty = true;
-            changed = true;
+        // Rasterize animated controls at the display cadence, not on every
+        // 4 ms input poll. The final sample is always invalidated even when an
+        // animation ends between display frames.
+        if !self.control_animations.is_empty() {
+            let mut index = 0;
+            while index < self.control_animations.len() {
+                let animation = self.control_animations[index];
+                let finished = now_ns.saturating_sub(animation.started_ns)
+                    >= animation.duration_ns;
+                if animation_frame_due || finished {
+                    self.damage_node(animation.idx);
+                    self.dirty = true;
+                    changed = true;
+                }
+                if finished {
+                    self.control_animations.swap_remove(index);
+                } else {
+                    index += 1;
+                }
+            }
         }
-        // Keep a focused text field alive while its native caret blinks.  The
-        // caret is painted independently from the field's text value.
-        if self.focused.is_some() {
-            self.dirty = true;
-            changed = true;
+        // Keep a focused text field alive only when its 500 ms caret phase
+        // changes. Previously this invalidated the field on every input poll.
+        if let Some(idx) = self.focused {
+            let phase = now_ns / 500_000_000;
+            if self.caret_phase != Some(phase) {
+                self.caret_phase = Some(phase);
+                self.damage_node(idx);
+                self.dirty = true;
+                changed = true;
+            }
+        } else {
+            self.caret_phase = None;
         }
         if let Some(fade) = self.spinner_fade {
-            if now_ns.saturating_sub(fade.started_ns) >= 140_000_000 {
+            let finished = now_ns.saturating_sub(fade.started_ns) >= 140_000_000;
+            if animation_frame_due || finished {
+                // The fading popup overlays only its own rectangle; repaint
+                // that region plus the spinner control at display cadence.
+                let (px, py, pw, ph) = self.spinner_popup_rect(fade.idx);
+                self.damage_rect(
+                    px.saturating_sub(2),
+                    py.saturating_sub(2),
+                    pw.saturating_add(4),
+                    ph.saturating_add(4),
+                );
+                self.damage_node(fade.idx);
+                self.dirty = true;
+                changed = true;
+            }
+            if finished {
                 self.spinner_fade = None;
-                // The last translucent frame must be invalidated as well so
-                // the underlying content is painted back over the popup.
-                self.dirty = true;
-                changed = true;
-            } else {
-                self.dirty = true;
-                changed = true;
             }
         }
         changed
@@ -557,6 +813,9 @@ impl Warp4Engine {
         self.nodes.clear();
         self.roots.clear();
         self.fixed_subtree.clear();
+        self.focusable_nodes.clear();
+        self.focus_positions.clear();
+        self.focus_cache_valid = false;
         self.focused = None;
         self.keyboard_focus = None;
         self.hovered = None;
@@ -565,6 +824,7 @@ impl Warp4Engine {
         self.spinner_open = None;
         self.spinner_fade = None;
         self.control_animations.clear();
+        self.last_animation_frame = None;
         self.flip_elapsed_ns = 0;
         self.last_tick_ns = None;
         self.transition_elapsed_ns = None;
@@ -713,6 +973,8 @@ impl Warp4Engine {
         self.scroll_subpixel = self.scroll_subpixel.min(max_scroll.saturating_mul(3));
         self.scroll_target_subpixel = self.scroll_target_subpixel.min(max_scroll.saturating_mul(3));
         self.scroll_start_subpixel = self.scroll_start_subpixel.min(max_scroll.saturating_mul(3));
+        self.rebuild_focusable_nodes();
+        self.damage_all();
         self.dirty = false;
         self.layout_dirty = false;
     }

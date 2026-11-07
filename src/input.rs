@@ -12,6 +12,12 @@ impl Warp4Engine {
         let popup_hit = self.spinner_popup_hit(x, y);
         let next = popup_hit.map(|(idx, _)| idx).or_else(|| self.hit(x, y));
         if self.hovered != next {
+            if let Some(idx) = self.hovered {
+                self.damage_node(idx);
+            }
+            if let Some(idx) = next {
+                self.damage_node(idx);
+            }
             self.hovered = next;
             self.dirty = true;
             return true;
@@ -25,6 +31,14 @@ impl Warp4Engine {
             idx,
             started_ns: self.now_ns,
         });
+        let (x, y, w, h) = self.spinner_popup_rect(idx);
+        self.damage_rect(
+            x.saturating_sub(2),
+            y.saturating_sub(2),
+            w.saturating_add(4),
+            h.saturating_add(4),
+        );
+        self.damage_node(idx);
         self.dirty = true;
     }
 
@@ -44,6 +58,7 @@ impl Warp4Engine {
                 RADIO_DURATION_NS
             },
         });
+        self.damage_node(idx);
         self.dirty = true;
     }
 
@@ -92,10 +107,22 @@ impl Warp4Engine {
             return;
         }
         let Some(idx) = self.hit(x, y) else {
+            let old_focused = self.focused;
+            let old_keyboard_focus = self.keyboard_focus;
+            let old_pressed = self.pressed;
             self.focused = None;
             self.keyboard_focus = None;
             self.pressed = None;
             self.keyboard_press_until_ns = None;
+            if let Some(i) = old_focused {
+                self.damage_node(i);
+            }
+            if let Some(i) = old_keyboard_focus {
+                self.damage_node(i);
+            }
+            if let Some(i) = old_pressed {
+                self.damage_node(i);
+            }
             self.dirty = true;
             return;
         };
@@ -103,18 +130,34 @@ impl Warp4Engine {
     }
 
     pub(crate) fn activate_index(&mut self, idx: usize, keyboard: bool, x: i32) {
+        let old_keyboard_focus = self.keyboard_focus;
+        let old_focused = self.focused;
         self.pressed = Some(idx);
+        self.damage_node(idx);
         self.keyboard_press_until_ns =
             keyboard.then_some(self.now_ns.saturating_add(KEYBOARD_PRESS_NS));
         self.keyboard_focus = Some(idx);
+        if old_keyboard_focus != Some(idx) {
+            if let Some(i) = old_keyboard_focus {
+                self.damage_node(i);
+            }
+        }
         self.last_clicked_id = Some(self.nodes[idx].id().to_string());
         if is_text_input(&self.nodes[idx]) {
+            if old_focused != Some(idx) {
+                if let Some(i) = old_focused {
+                    self.damage_node(i);
+                }
+            }
             self.focused = Some(idx);
             self.dirty = true;
             return;
         }
         // Clicking another control follows normal native focus semantics: an
         // EditText loses focus as soon as a different view is activated.
+        if let Some(i) = old_focused {
+            self.damage_node(i);
+        }
         self.focused = None;
         if self.nodes[idx].is("Switch")
             || self.nodes[idx].is("CheckBox")
@@ -123,7 +166,11 @@ impl Warp4Engine {
         {
             if self.nodes[idx].is("RadioButton") {
                 if let Some(parent) = self.nodes[idx].parent {
-                    for sibling in self.nodes[parent].children.clone() {
+                    let sibling_count = self.nodes[parent].children.len();
+                    for position in 0..sibling_count {
+                        let Some(&sibling) = self.nodes[parent].children.get(position) else {
+                            continue;
+                        };
                         if self.nodes[sibling].is("RadioButton") {
                             let old = self.nodes[sibling].attr("checked") == "true";
                             let next = sibling == idx;
@@ -159,8 +206,12 @@ impl Warp4Engine {
         } else if self.nodes[idx].is("Spinner") {
             self.spinner_open = Some(idx);
             self.spinner_fade = None;
+            self.damage_all();
         }
         self.run_click_actions(idx);
+        if self.layout_dirty {
+            self.damage_all();
+        }
         self.dirty = true;
     }
 
@@ -174,6 +225,7 @@ impl Warp4Engine {
             bdf_font::preload_text(text);
             self.dirty = true;
             self.layout_dirty = true;
+            self.damage_all();
         }
     }
 
@@ -187,6 +239,7 @@ impl Warp4Engine {
             self.nodes[idx].hidden = !visible;
             self.dirty = true;
             self.layout_dirty = true;
+            self.damage_all();
         }
     }
 
@@ -197,6 +250,7 @@ impl Warp4Engine {
                 "selected",
                 if selected { "true" } else { "false" },
             );
+            self.damage_node(idx);
             self.dirty = true;
         }
     }
@@ -204,6 +258,7 @@ impl Warp4Engine {
     pub fn set_state_value(&mut self, key: &str, value: &str) {
         self.set_state(key, value);
         self.dirty = true;
+        self.damage_all();
     }
 
     /// Update a pointer-controlled widget while the primary pointer is held.
@@ -224,6 +279,7 @@ impl Warp4Engine {
             self.set_rating(idx, x)
         };
         if changed {
+            self.damage_node(idx);
             self.dirty = true;
         }
         let _ = y;
@@ -243,8 +299,9 @@ impl Warp4Engine {
     }
 
     pub fn release(&mut self) {
-        if self.pressed.take().is_some() {
+        if let Some(idx) = self.pressed.take() {
             self.keyboard_press_until_ns = None;
+            self.damage_node(idx);
             self.dirty = true;
         }
     }
@@ -272,6 +329,7 @@ impl Warp4Engine {
         bdf_font::preload_text(&value);
         self.dirty = true;
         self.layout_dirty = true;
+        self.damage_all();
     }
 
     pub(crate) fn hit(&self, x: i32, y: i32) -> Option<usize> {

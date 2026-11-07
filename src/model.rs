@@ -1,5 +1,8 @@
 use super::*;
 use alloc::boxed::Box;
+
+/// Fixed-capacity damage list; overflow safely falls back to a full repaint.
+pub(crate) const MAX_DAMAGE_REGIONS: usize = 16;
 #[derive(Clone)]
 pub(crate) struct Attr {
     pub(crate) key: Box<str>,
@@ -88,6 +91,12 @@ pub struct Warp4Engine {
     pub(crate) state: Vec<(String, String)>,
     pub(crate) focused: Option<usize>,
     pub(crate) keyboard_focus: Option<usize>,
+    /// Precomputed keyboard-focus candidates; rebuilt only when the view tree
+    /// or active visibility set changes.
+    pub(crate) focusable_nodes: Vec<usize>,
+    /// Node-indexed focus position map; usize::MAX marks a non-focusable node.
+    pub(crate) focus_positions: Vec<usize>,
+    pub(crate) focus_cache_valid: bool,
     pub(crate) hovered: Option<usize>,
     pub(crate) pressed: Option<usize>,
     pub(crate) keyboard_press_until_ns: Option<u64>,
@@ -109,6 +118,14 @@ pub struct Warp4Engine {
     pub last_command: Option<String>,
     pub(crate) dirty: bool,
     pub(crate) layout_dirty: bool,
+    /// Independent damaged rectangles since the last paint. Keeping old/new
+    /// focus controls separate avoids repainting the space between them.
+    pub(crate) damage_regions: [(i32, i32, i32, i32); MAX_DAMAGE_REGIONS],
+    pub(crate) damage_count: usize,
+    /// When true, the whole layer must be repainted (scroll, layout, screen
+    /// change, or a script action that may touch arbitrary nodes). Dominates
+    /// any partial `damage`.
+    pub(crate) damage_full: bool,
     pub(crate) now_ns: u64,
     pub(crate) wait_until_ns: Option<u64>,
     pub(crate) pending: Vec<Action>,
@@ -116,6 +133,10 @@ pub struct Warp4Engine {
     pub(crate) flip_elapsed_ns: u64,
     pub(crate) last_tick_ns: Option<u64>,
     pub(crate) control_animations: Vec<ControlAnimation>,
+    /// Last 8 ms animation sample already rasterized for all transient effects.
+    pub(crate) last_animation_frame: Option<u64>,
+    /// Last half-second caret blink phase that was rasterized.
+    pub(crate) caret_phase: Option<u64>,
     pub(crate) transition_elapsed_ns: Option<u64>,
     pub(crate) last_clicked_id: Option<String>,
     pub(crate) runtime_fps: u32,

@@ -122,6 +122,7 @@ impl Warp4Engine {
             self.paint_spinner_popup(layer, fade.idx, opacity);
         }
         self.paint_transition(layer);
+        self.clear_damage();
     }
 
     /// Paint one horizontal slice of the viewport into a small band layer.
@@ -313,486 +314,495 @@ impl Warp4Engine {
         };
         let w = n.w.max(1) as usize;
         let h = n.h.max(1) as usize;
-        if !(pass == PaintPass::Fixed && fixed && is_scroll_container(n)) {
-            if let Some(fill) = parse_color(n.attr("background")) {
-                let radius = parse_dim(n.attr("cornerRadius"), 0).max(0) as usize;
-                if radius > 0 {
-                    fill_ui_rounded_rect_at(
+        let (clip_x0, clip_y0, clip_x1, clip_y1) = layer.clip_bounds();
+        // Include the same two-pixel safety margin used by damage_node so
+        // antialiased edges and small shadows are not skipped at clip edges.
+        let draw_self = x.saturating_sub(2) < clip_x1 as i32
+            && y.saturating_sub(2) < clip_y1 as i32
+            && x.saturating_add(w as i32).saturating_add(2) > clip_x0 as i32
+            && y.saturating_add(h as i32).saturating_add(2) > clip_y0 as i32;
+        if draw_self {
+            if !(pass == PaintPass::Fixed && fixed && is_scroll_container(n)) {
+                if let Some(fill) = parse_color(n.attr("background")) {
+                    let radius = parse_dim(n.attr("cornerRadius"), 0).max(0) as usize;
+                    if radius > 0 {
+                        fill_ui_rounded_rect_at(
+                            layer,
+                            x,
+                            y,
+                            w,
+                            h,
+                            radius.min(w / 2).min(h / 2),
+                            fill,
+                        );
+                    } else {
+                        layer.fill_rect_signed(x, y, w, h, fill);
+                    }
+                }
+            }
+            if is_button_like(n) {
+                let active = self.pressed == Some(idx);
+                let hover = self.hovered == Some(idx);
+                let selected = n.attr("selected") == "true";
+                let primary = n.is("PrimaryButton");
+                let button_h = h;
+                let button_radius = if is_xiao() {
+                    palette().button_radius
+                } else {
+                    w.min(h) / 2
+                };
+                draw_ui_button(
+                    layer,
+                    x,
+                    y,
+                    w,
+                    button_h,
+                    button_radius,
+                    ui_button_face(active, selected, hover, primary),
+                    active,
+                    primary,
+                );
+                if self.keyboard_focus == Some(idx) && w > 6 && h > 6 {
+                    // Keep the focus indication inside the button's existing
+                    // one-pixel frame so keyboard navigation is visible without
+                    // changing XML geometry.
+                    // The origin stays signed: a button above the current band
+                    // must not be pinned to the band's top row (that repeated the
+                    // frame down every band).
+                    let ring = if is_xiao() {
+                        Color::rgb(0xF2, 0xF2, 0xF7)
+                    } else {
+                        Color::BLACK
+                    };
+                    layer.rect_outline_signed(
+                        x.saturating_add(3),
+                        y.saturating_add(3),
+                        w.saturating_sub(6),
+                        h.saturating_sub(6),
+                        ring,
+                    );
+                }
+            } else if n.is("EditText")
+                || n.is("AutoCompleteTextView")
+                || n.is("MultiAutoCompleteTextView")
+            {
+                if is_xiao() {
+                    draw_ui_input(layer, x, y, w, h);
+                } else {
+                    outline_ui_rounded_rect_at(
                         layer,
                         x,
                         y,
                         w,
                         h,
-                        radius.min(w / 2).min(h / 2),
-                        fill,
+                        ui_px_usize(WARP4_INPUT_RADIUS).min(w / 2).min(h / 2),
+                        palette().warp4_input_border,
+                        palette().warp4_input_bg,
                     );
-                } else {
-                    layer.fill_rect_signed(x, y, w, h, fill);
                 }
-            }
-        }
-        if is_button_like(n) {
-            let active = self.pressed == Some(idx);
-            let hover = self.hovered == Some(idx);
-            let selected = n.attr("selected") == "true";
-            let primary = n.is("PrimaryButton");
-            let button_h = h;
-            let button_radius = if is_xiao() {
-                palette().button_radius
-            } else {
-                w.min(h) / 2
-            };
-            draw_ui_button(
-                layer,
-                x,
-                y,
-                w,
-                button_h,
-                button_radius,
-                ui_button_face(active, selected, hover, primary),
-                active,
-                primary,
-            );
-            if self.keyboard_focus == Some(idx) && w > 6 && h > 6 {
-                // Keep the focus indication inside the button's existing
-                // one-pixel frame so keyboard navigation is visible without
-                // changing XML geometry.
-                // The origin stays signed: a button above the current band
-                // must not be pinned to the band's top row (that repeated the
-                // frame down every band).
-                let ring = if is_xiao() {
-                    Color::rgb(0xF2, 0xF2, 0xF7)
-                } else {
-                    Color::BLACK
-                };
-                layer.rect_outline_signed(
-                    x.saturating_add(3),
-                    y.saturating_add(3),
-                    w.saturating_sub(6),
-                    h.saturating_sub(6),
-                    ring,
-                );
-            }
-        } else if n.is("EditText")
-            || n.is("AutoCompleteTextView")
-            || n.is("MultiAutoCompleteTextView")
-        {
-            if is_xiao() {
-                draw_ui_input(layer, x, y, w, h);
-            } else {
-                outline_ui_rounded_rect_at(
-                    layer,
-                    x,
-                    y,
-                    w,
-                    h,
-                    ui_px_usize(WARP4_INPUT_RADIUS).min(w / 2).min(h / 2),
-                    palette().warp4_input_border,
-                    palette().warp4_input_bg,
-                );
-            }
-        } else if n.is("CheckBox") || n.is("RadioButton") {
-            let checked = n.attr("checked") == "true";
-            let hover = self.hovered == Some(idx);
-            let mark_x = x + ui_px(2);
-            let mark_y = y + (n.h - ui_px(if n.is("RadioButton") { 18 } else { 22 })).max(0) / 2;
-            if n.is("CheckBox") {
-                if is_xiao() {
-                    draw_ui_checkbox(
-                        layer,
-                        mark_x,
-                        mark_y,
-                        ui_px_usize(22),
-                        checked,
-                        hover,
-                    );
-                } else {
-                    let border = if checked || hover {
-                        palette().warp3_accent
+            } else if n.is("CheckBox") || n.is("RadioButton") {
+                let checked = n.attr("checked") == "true";
+                let hover = self.hovered == Some(idx);
+                let mark_x = x + ui_px(2);
+                let mark_y = y + (n.h - ui_px(if n.is("RadioButton") { 18 } else { 22 })).max(0) / 2;
+                if n.is("CheckBox") {
+                    if is_xiao() {
+                        draw_ui_checkbox(
+                            layer,
+                            mark_x,
+                            mark_y,
+                            ui_px_usize(22),
+                            checked,
+                            hover,
+                        );
                     } else {
-                        palette().warp3_muted
-                    };
-                    outline_ui_rounded_rect_at(
-                        layer,
-                        mark_x,
-                        mark_y,
-                        ui_px_usize(22),
-                        ui_px_usize(22),
-                        ui_px_usize(4),
-                        border,
-                        if checked {
+                        let border = if checked || hover {
                             palette().warp3_accent
                         } else {
-                            palette().warp3_surface
-                        },
-                    );
-                    if checked {
-                        draw_check_icon(layer, mark_x + ui_px(5), mark_y + ui_px(5));
+                            palette().warp3_muted
+                        };
+                        outline_ui_rounded_rect_at(
+                            layer,
+                            mark_x,
+                            mark_y,
+                            ui_px_usize(22),
+                            ui_px_usize(22),
+                            ui_px_usize(4),
+                            border,
+                            if checked {
+                                palette().warp3_accent
+                            } else {
+                                palette().warp3_surface
+                            },
+                        );
+                        if checked {
+                            draw_check_icon(layer, mark_x + ui_px(5), mark_y + ui_px(5));
+                        }
                     }
-                }
-            } else {
-                let amount = self.control_amount(idx, checked);
-                let outer = if self
-                    .control_animations
-                    .iter()
-                    .any(|animation| animation.idx == idx)
-                {
-                    mix_color(palette().warp4_radio_off, palette().warp4_primary, amount)
-                } else if checked {
-                    palette().warp4_primary
                 } else {
-                    palette().warp4_radio_off
-                };
-                fill_ui_circle_at(
-                    layer,
-                    mark_x + ui_px(9),
-                    mark_y + ui_px(9),
-                    ui_px_usize(9),
-                    outer,
-                );
-                let inner_radius = (ui_size(4.0) * amount + ui_size(0.5)) as usize;
-                if inner_radius > 0 {
+                    let amount = self.control_amount(idx, checked);
+                    let outer = if self
+                        .control_animations
+                        .iter()
+                        .any(|animation| animation.idx == idx)
+                    {
+                        mix_color(palette().warp4_radio_off, palette().warp4_primary, amount)
+                    } else if checked {
+                        palette().warp4_primary
+                    } else {
+                        palette().warp4_radio_off
+                    };
                     fill_ui_circle_at(
                         layer,
                         mark_x + ui_px(9),
                         mark_y + ui_px(9),
-                        inner_radius,
-                        WARP4_WHITE,
+                        ui_px_usize(9),
+                        outer,
                     );
-                }
-            }
-        } else if n.is("Switch") {
-            if is_xiao() {
-                draw_ui_switch(layer, x, y, n.h, n.attr("checked") == "true");
-            } else {
-                let on = n.attr("checked") == "true";
-                let amount = self.control_amount(idx, on);
-                let track = mix_color(palette().warp3_bg, palette().warp3_accent, amount);
-                let sy = y + (n.h - ui_px(22)).max(0) / 2;
-                let track_w = ui_px_usize(44);
-                outline_ui_rounded_rect_at(
-                    layer,
-                    x,
-                    sy,
-                    track_w,
-                    ui_px_usize(22),
-                    ui_px_usize(11),
-                    mix_color(palette().warp3_muted, palette().warp3_accent, amount),
-                    track,
-                );
-                // Warp3 uses a compact 14px knob inside the 22px track.
-                let knob_x = x
-                    + ui_px(10)
-                    + ((track_w as f32 - ui_size(20.0)) * amount + ui_size(0.5)) as i32;
-                fill_ui_circle_at(
-                    layer,
-                    knob_x,
-                    sy + ui_px(11),
-                    ui_px_usize(7),
-                    mix_color(Color::rgb(102, 102, 102), Color::rgb(255, 255, 255), amount),
-                );
-            }
-        } else if n.is("Spinner") || n.is("SearchView") {
-            layer.fill_rect_signed(
-                x,
-                y + h as i32 - ui_px(2),
-                w,
-                ui_px_usize(2).max(1),
-                if self.hovered == Some(idx) {
-                    palette().warp3_accent
-                } else {
-                    palette().warp3_border
-                },
-            );
-            if n.is("Spinner") {
-                let selected = parse_i32(n.attr("selectedIndex")).max(0) as usize;
-                let value = if !n.attr("text").is_empty() {
-                    n.attr("text")
-                } else if !n.attr("value").is_empty() {
-                    n.attr("value")
-                } else if let Some(item) = n
-                    .attr("items")
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|item| !item.is_empty())
-                    .nth(selected)
-                {
-                    item
-                } else {
-                    match selected % 3 {
-                        1 => "Item 2",
-                        2 => "Item 3",
-                        _ => "Item 1",
+                    let inner_radius = (ui_size(4.0) * amount + ui_size(0.5)) as usize;
+                    if inner_radius > 0 {
+                        fill_ui_circle_at(
+                            layer,
+                            mark_x + ui_px(9),
+                            mark_y + ui_px(9),
+                            inner_radius,
+                            WARP4_WHITE,
+                        );
                     }
-                };
-                put_str_size(
-                    layer,
-                    x + ui_px(7),
-                    y + ((h as i32 - ui_px(19)).max(0) / 2),
-                    value,
-                    palette().warp3_text,
-                    ui_size(15.0),
-                );
-                // Native equivalent of the CSS select arrow.
-                let ax = x + n.w - ui_px(14);
-                let ay = y + h as i32 / 2 - ui_px(2);
-                for row in 0..ui_px_usize(5) {
-                    let width = ui_px_usize(2) + row * ui_px_usize(2);
-                    let row = row as i32;
-                    layer.fill_rect_signed(
-                        ax - row,
-                        ay + row,
-                        width as usize,
-                        1,
-                        palette().warp3_muted,
+                }
+            } else if n.is("Switch") {
+                if is_xiao() {
+                    draw_ui_switch(layer, x, y, n.h, n.attr("checked") == "true");
+                } else {
+                    let on = n.attr("checked") == "true";
+                    let amount = self.control_amount(idx, on);
+                    let track = mix_color(palette().warp3_bg, palette().warp3_accent, amount);
+                    let sy = y + (n.h - ui_px(22)).max(0) / 2;
+                    let track_w = ui_px_usize(44);
+                    outline_ui_rounded_rect_at(
+                        layer,
+                        x,
+                        sy,
+                        track_w,
+                        ui_px_usize(22),
+                        ui_px_usize(11),
+                        mix_color(palette().warp3_muted, palette().warp3_accent, amount),
+                        track,
+                    );
+                    // Warp3 uses a compact 14px knob inside the 22px track.
+                    let knob_x = x
+                        + ui_px(10)
+                        + ((track_w as f32 - ui_size(20.0)) * amount + ui_size(0.5)) as i32;
+                    fill_ui_circle_at(
+                        layer,
+                        knob_x,
+                        sy + ui_px(11),
+                        ui_px_usize(7),
+                        mix_color(Color::rgb(102, 102, 102), Color::rgb(255, 255, 255), amount),
                     );
                 }
-            }
-        } else if n.is("SeekBar") {
-            let cy = y + h as i32 / 2;
-            layer.fill_rect_signed(
-                x,
-                cy,
-                w,
-                ui_px_usize(3).max(1),
-                if self.hovered == Some(idx) {
-                    palette().warp3_accent
-                } else {
-                    palette().warp3_border
-                },
-            );
-            let max = parse_i32(n.attr("max")).max(1);
-            let progress = parse_i32(n.attr("progress")).clamp(0, max);
-            let px = x + w as i32 * progress / max;
-            if progress > 0 {
+            } else if n.is("Spinner") || n.is("SearchView") {
+                layer.fill_rect_signed(
+                    x,
+                    y + h as i32 - ui_px(2),
+                    w,
+                    ui_px_usize(2).max(1),
+                    if self.hovered == Some(idx) {
+                        palette().warp3_accent
+                    } else {
+                        palette().warp3_border
+                    },
+                );
+                if n.is("Spinner") {
+                    let selected = parse_i32(n.attr("selectedIndex")).max(0) as usize;
+                    let value = if !n.attr("text").is_empty() {
+                        n.attr("text")
+                    } else if !n.attr("value").is_empty() {
+                        n.attr("value")
+                    } else if let Some(item) = n
+                        .attr("items")
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|item| !item.is_empty())
+                        .nth(selected)
+                    {
+                        item
+                    } else {
+                        match selected % 3 {
+                            1 => "Item 2",
+                            2 => "Item 3",
+                            _ => "Item 1",
+                        }
+                    };
+                    put_str_size(
+                        layer,
+                        x + ui_px(7),
+                        y + ((h as i32 - ui_px(19)).max(0) / 2),
+                        value,
+                        palette().warp3_text,
+                        ui_size(15.0),
+                    );
+                    // Native equivalent of the CSS select arrow.
+                    let ax = x + n.w - ui_px(14);
+                    let ay = y + h as i32 / 2 - ui_px(2);
+                    for row in 0..ui_px_usize(5) {
+                        let width = ui_px_usize(2) + row * ui_px_usize(2);
+                        let row = row as i32;
+                        layer.fill_rect_signed(
+                            ax - row,
+                            ay + row,
+                            width as usize,
+                            1,
+                            palette().warp3_muted,
+                        );
+                    }
+                }
+            } else if n.is("SeekBar") {
+                let cy = y + h as i32 / 2;
                 layer.fill_rect_signed(
                     x,
                     cy,
-                    (px - x).max(0) as usize,
-                    ui_px_usize(3).max(1),
-                    palette().warp3_accent,
-                );
-            }
-            fill_ui_circle_at(
-                layer,
-                px,
-                cy,
-                ui_px_usize(if self.hovered == Some(idx) { 10 } else { 9 }).max(1),
-                palette().warp3_accent,
-            );
-        } else if n.is("RatingBar") {
-            let stars = parse_i32(n.attr("numStars")).max(1).min(10);
-            let rating = n.attr("rating").parse::<f32>().unwrap_or(0.0);
-            let hover = self.hovered == Some(idx);
-            for star in 0..stars {
-                let color = if star as f32 + 0.5 <= rating {
-                    palette().warp3_accent
-                } else if hover {
-                    Color::rgb(158, 190, 220)
-                } else {
-                    Color::rgb(183, 183, 183)
-                };
-                put_str_size(layer, x + star * ui_px(23), y, "★", color, ui_size(25.0));
-            }
-        } else if n.is("ProgressBar") {
-            if n.attr("style").contains("progressBarStyleHorizontal") || w > ui_px_usize(80) {
-                fill_ui_rounded_rect_at(
-                    layer,
-                    x,
-                    y + ui_px(2),
                     w,
-                    ui_px_usize(6).max(1),
-                    ui_px_usize(3),
-                    palette().warp3_border,
+                    ui_px_usize(3).max(1),
+                    if self.hovered == Some(idx) {
+                        palette().warp3_accent
+                    } else {
+                        palette().warp3_border
+                    },
                 );
                 let max = parse_i32(n.attr("max")).max(1);
                 let progress = parse_i32(n.attr("progress")).clamp(0, max);
-                fill_ui_rounded_rect_at(
+                let px = x + w as i32 * progress / max;
+                if progress > 0 {
+                    layer.fill_rect_signed(
+                        x,
+                        cy,
+                        (px - x).max(0) as usize,
+                        ui_px_usize(3).max(1),
+                        palette().warp3_accent,
+                    );
+                }
+                fill_ui_circle_at(
                     layer,
-                    x,
-                    y + ui_px(2),
-                    (w as i32 * progress / max) as usize,
-                    ui_px_usize(6).max(1),
-                    ui_px_usize(3),
+                    px,
+                    cy,
+                    ui_px_usize(if self.hovered == Some(idx) { 10 } else { 9 }).max(1),
                     palette().warp3_accent,
                 );
-            } else {
-                let cx = x + w as i32 / 2;
-                let cy = y + h as i32 / 2;
-                let outer_radius = ui_px(14);
-                let inner_radius = ui_px(9);
-                fill_ui_circle_at(
-                    layer,
-                    cx,
-                    cy,
-                    outer_radius.max(1) as usize,
-                    Color::rgb(207, 207, 207),
-                );
-                fill_ui_circle_at(
-                    layer,
-                    cx,
-                    cy,
-                    inner_radius.max(1) as usize,
-                    Color::rgb(255, 255, 255),
-                );
-                for dy in -outer_radius..=outer_radius {
-                    for dx in -outer_radius..=outer_radius {
-                        let radius = dx * dx + dy * dy;
-                        if radius <= outer_radius * outer_radius
-                            && radius >= inner_radius * inner_radius
-                            && (dx >= 0 || dy <= 0)
-                        {
-                            let px = cx + dx;
-                            let py = cy + dy;
-                            layer.fill_rect_signed(px, py, 1, 1, palette().warp3_accent);
+            } else if n.is("RatingBar") {
+                let stars = parse_i32(n.attr("numStars")).max(1).min(10);
+                let rating = n.attr("rating").parse::<f32>().unwrap_or(0.0);
+                let hover = self.hovered == Some(idx);
+                for star in 0..stars {
+                    let color = if star as f32 + 0.5 <= rating {
+                        palette().warp3_accent
+                    } else if hover {
+                        Color::rgb(158, 190, 220)
+                    } else {
+                        Color::rgb(183, 183, 183)
+                    };
+                    put_str_size(layer, x + star * ui_px(23), y, "★", color, ui_size(25.0));
+                }
+            } else if n.is("ProgressBar") {
+                if n.attr("style").contains("progressBarStyleHorizontal") || w > ui_px_usize(80) {
+                    fill_ui_rounded_rect_at(
+                        layer,
+                        x,
+                        y + ui_px(2),
+                        w,
+                        ui_px_usize(6).max(1),
+                        ui_px_usize(3),
+                        palette().warp3_border,
+                    );
+                    let max = parse_i32(n.attr("max")).max(1);
+                    let progress = parse_i32(n.attr("progress")).clamp(0, max);
+                    fill_ui_rounded_rect_at(
+                        layer,
+                        x,
+                        y + ui_px(2),
+                        (w as i32 * progress / max) as usize,
+                        ui_px_usize(6).max(1),
+                        ui_px_usize(3),
+                        palette().warp3_accent,
+                    );
+                } else {
+                    let cx = x + w as i32 / 2;
+                    let cy = y + h as i32 / 2;
+                    let outer_radius = ui_px(14);
+                    let inner_radius = ui_px(9);
+                    fill_ui_circle_at(
+                        layer,
+                        cx,
+                        cy,
+                        outer_radius.max(1) as usize,
+                        Color::rgb(207, 207, 207),
+                    );
+                    fill_ui_circle_at(
+                        layer,
+                        cx,
+                        cy,
+                        inner_radius.max(1) as usize,
+                        Color::rgb(255, 255, 255),
+                    );
+                    for dy in -outer_radius..=outer_radius {
+                        for dx in -outer_radius..=outer_radius {
+                            let radius = dx * dx + dy * dy;
+                            if radius <= outer_radius * outer_radius
+                                && radius >= inner_radius * inner_radius
+                                && (dx >= 0 || dy <= 0)
+                            {
+                                let px = cx + dx;
+                                let py = cy + dy;
+                                layer.fill_rect_signed(px, py, 1, 1, palette().warp3_accent);
+                            }
                         }
                     }
                 }
-            }
-        } else if n.is("ImageView") {
-            if x < 0 || y < 0 {
-                fill_ui_rounded_rect_at(layer, x, y, w, h, 0, palette().warp3_border);
-            } else {
-                layer.rect_outline(
-                    x as usize,
-                    y as usize,
-                w,
-                h,
-                palette().warp3_border,
-                );
-            }
-        } else if n.is("ListView") || n.is("ExpandableListView") {
-            let row_h = ui_px_usize(44).max(1);
-            for row in 0..(h / row_h) {
-                let ry = y + row as i32 * row_h as i32;
-                layer.fill_rect_signed(
-                    x,
-                    ry,
+            } else if n.is("ImageView") {
+                if x < 0 || y < 0 {
+                    fill_ui_rounded_rect_at(layer, x, y, w, h, 0, palette().warp3_border);
+                } else {
+                    layer.rect_outline(
+                        x as usize,
+                        y as usize,
                     w,
-                    row_h.saturating_sub(1).max(1),
-                    palette().warp3_surface,
-                );
-                layer.fill_rect_signed(
-                    x,
-                    ry + row_h.saturating_sub(1) as i32,
-                    w,
-                    1,
+                    h,
                     palette().warp3_border,
-                );
-                put_str_size(
-                    layer,
-                    x + ui_px(12),
-                    ry + ui_px(12),
-                    &format!("Item {}", row + 1),
-                    palette().warp3_text,
-                    ui_size(14.0),
-                );
-            }
-        }
-        let text = if !n.attr("text").is_empty() {
-            n.attr("text")
-        } else if n.is("ToggleButton") {
-            if n.attr("checked") == "true" {
-                n.attr("textOn")
-            } else {
-                n.attr("textOff")
-            }
-        } else {
-            ""
-        };
-        if !text.is_empty() {
-            let color = text_color(n);
-            let size = text_size(n);
-            let pad = edges(n, "padding");
-            let text_w = measure_size(text, size);
-            let tx = if is_text_button(n) {
-                x + (n.w - text_w).max(0) / 2
-            } else if n.is("EditText")
-                || n.is("AutoCompleteTextView")
-                || n.is("MultiAutoCompleteTextView")
-            {
-                // Warp3 inputs use a fixed 10px text inset; using the XML
-                // padding here made the value appear vertically/horizontally
-                // displaced between focused and unfocused states.
-                x + ui_px(10)
-            } else if ascii_contains_ignore_case(n.attr("gravity"), "right")
-                || ascii_contains_ignore_case(n.attr("gravity"), "end")
-            {
-                x + n.w - text_w - pad.right
-            } else if ascii_contains_ignore_case(n.attr("gravity"), "center") {
-                x + (n.w - text_w) / 2
-            } else {
-                x + pad.left
-                    + if n.is("CheckBox") {
-                        ui_px(32)
-                    } else if n.is("RadioButton") {
-                        ui_px(28)
-                    } else if n.is("Switch") {
-                        ui_px(55)
-                    } else {
-                        0
-                    }
-            };
-            let line_h = if is_xiao_size() && bdf_font::is_available() {
-                // Misaki Gothic is an 8px bitmap font. Use its real line box
-                // for centering instead of the 25%-scaled nominal text size.
-                8
-            } else {
-                (size * 1.25) as i32
-            };
-            let line_count = text.split('\n').count().max(1) as i32;
-            let block_h = line_h * line_count;
-            let gravity = n.attr("gravity");
-            let ty = if is_text_button(n) {
-                // Text is centered in the actual XML-resolved button bounds;
-                // the compact padding rule must not shift it vertically.
-                y + (n.h - block_h).max(0) / 2
-            } else if n.is("EditText")
-                || n.is("AutoCompleteTextView")
-                || n.is("MultiAutoCompleteTextView")
-            {
-                y + ui_px(8)
-            } else if ascii_contains_ignore_case(gravity, "bottom") {
-                y + n.h - pad.bottom - block_h
-            } else if ascii_contains_ignore_case(gravity, "center_vertical")
-                || gravity.eq_ignore_ascii_case("center")
-                || ascii_contains_ignore_case(gravity, "center|vertical")
-            {
-                y + (n.h - block_h).max(0) / 2
-            } else {
-                y + pad.top
-            };
-            for (line, part) in text.split('\n').enumerate() {
-                let line_y = ty + line as i32 * line_h;
-                put_str_size(layer, tx, line_y, part, color, size);
-                if text_bold(n) {
-                    put_str_size(layer, tx + 1, line_y, part, color, size);
+                    );
+                }
+            } else if n.is("ListView") || n.is("ExpandableListView") {
+                let row_h = ui_px_usize(44).max(1);
+                for row in 0..(h / row_h) {
+                    let ry = y + row as i32 * row_h as i32;
+                    layer.fill_rect_signed(
+                        x,
+                        ry,
+                        w,
+                        row_h.saturating_sub(1).max(1),
+                        palette().warp3_surface,
+                    );
+                    layer.fill_rect_signed(
+                        x,
+                        ry + row_h.saturating_sub(1) as i32,
+                        w,
+                        1,
+                        palette().warp3_border,
+                    );
+                    put_str_size(
+                        layer,
+                        x + ui_px(12),
+                        ry + ui_px(12),
+                        &format!("Item {}", row + 1),
+                        palette().warp3_text,
+                        ui_size(14.0),
+                    );
                 }
             }
-        } else if (n.is("EditText")
-            || n.is("AutoCompleteTextView")
-            || n.is("MultiAutoCompleteTextView"))
-            && !n.attr("hint").is_empty()
-        {
-            put_str_size(
-                layer,
-                x + ui_px(10),
-                y + ui_px(8),
-                n.attr("hint"),
-                palette().warp3_muted,
-                text_size(n),
-            );
-        }
-        if (n.is("EditText") || n.is("AutoCompleteTextView") || n.is("MultiAutoCompleteTextView"))
-            && self.focused == Some(idx)
-            && (self.now_ns / 500_000_000) % 2 == 0
-        {
-            let size = text_size(n);
-            let caret_x = x + ui_px(10) + measure_size(text, size);
-            let caret_y = y + ui_px(7);
-            let caret_h = (size * 1.25).max(1.0) as usize;
-            if caret_x >= 0 && caret_y >= 0 {
-                layer.fill_rect(caret_x as usize, caret_y as usize, 1, caret_h, WARP4_BLACK);
+            let text = if !n.attr("text").is_empty() {
+                n.attr("text")
+            } else if n.is("ToggleButton") {
+                if n.attr("checked") == "true" {
+                    n.attr("textOn")
+                } else {
+                    n.attr("textOff")
+                }
+            } else {
+                ""
+            };
+            if !text.is_empty() {
+                let color = text_color(n);
+                let size = text_size(n);
+                let pad = edges(n, "padding");
+                let text_w = measure_size(text, size);
+                let tx = if is_text_button(n) {
+                    x + (n.w - text_w).max(0) / 2
+                } else if n.is("EditText")
+                    || n.is("AutoCompleteTextView")
+                    || n.is("MultiAutoCompleteTextView")
+                {
+                    // Warp3 inputs use a fixed 10px text inset; using the XML
+                    // padding here made the value appear vertically/horizontally
+                    // displaced between focused and unfocused states.
+                    x + ui_px(10)
+                } else if ascii_contains_ignore_case(n.attr("gravity"), "right")
+                    || ascii_contains_ignore_case(n.attr("gravity"), "end")
+                {
+                    x + n.w - text_w - pad.right
+                } else if ascii_contains_ignore_case(n.attr("gravity"), "center") {
+                    x + (n.w - text_w) / 2
+                } else {
+                    x + pad.left
+                        + if n.is("CheckBox") {
+                            ui_px(32)
+                        } else if n.is("RadioButton") {
+                            ui_px(28)
+                        } else if n.is("Switch") {
+                            ui_px(55)
+                        } else {
+                            0
+                        }
+                };
+                let line_h = if is_xiao_size() && bdf_font::is_available() {
+                    // Misaki Gothic is an 8px bitmap font. Use its real line box
+                    // for centering instead of the 25%-scaled nominal text size.
+                    8
+                } else {
+                    (size * 1.25) as i32
+                };
+                let line_count = text.split('\n').count().max(1) as i32;
+                let block_h = line_h * line_count;
+                let gravity = n.attr("gravity");
+                let ty = if is_text_button(n) {
+                    // Text is centered in the actual XML-resolved button bounds;
+                    // the compact padding rule must not shift it vertically.
+                    y + (n.h - block_h).max(0) / 2
+                } else if n.is("EditText")
+                    || n.is("AutoCompleteTextView")
+                    || n.is("MultiAutoCompleteTextView")
+                {
+                    y + ui_px(8)
+                } else if ascii_contains_ignore_case(gravity, "bottom") {
+                    y + n.h - pad.bottom - block_h
+                } else if ascii_contains_ignore_case(gravity, "center_vertical")
+                    || gravity.eq_ignore_ascii_case("center")
+                    || ascii_contains_ignore_case(gravity, "center|vertical")
+                {
+                    y + (n.h - block_h).max(0) / 2
+                } else {
+                    y + pad.top
+                };
+                for (line, part) in text.split('\n').enumerate() {
+                    let line_y = ty + line as i32 * line_h;
+                    put_str_size(layer, tx, line_y, part, color, size);
+                    if text_bold(n) {
+                        put_str_size(layer, tx + 1, line_y, part, color, size);
+                    }
+                }
+            } else if (n.is("EditText")
+                || n.is("AutoCompleteTextView")
+                || n.is("MultiAutoCompleteTextView"))
+                && !n.attr("hint").is_empty()
+            {
+                put_str_size(
+                    layer,
+                    x + ui_px(10),
+                    y + ui_px(8),
+                    n.attr("hint"),
+                    palette().warp3_muted,
+                    text_size(n),
+                );
+            }
+            if (n.is("EditText") || n.is("AutoCompleteTextView") || n.is("MultiAutoCompleteTextView"))
+                && self.focused == Some(idx)
+                && (self.now_ns / 500_000_000) % 2 == 0
+            {
+                let size = text_size(n);
+                let caret_x = x + ui_px(10) + measure_size(text, size);
+                let caret_y = y + ui_px(7);
+                let caret_h = (size * 1.25).max(1.0) as usize;
+                if caret_x >= 0 && caret_y >= 0 {
+                    layer.fill_rect(caret_x as usize, caret_y as usize, 1, caret_h, WARP4_BLACK);
+                }
             }
         }
         let child_scroll = in_scroll || is_scroll_container(n);
@@ -824,7 +834,7 @@ impl Warp4Engine {
             );
         }
         if is_scroll_container(n) {
-            if n.is("ScrollView") && n.content_h > n.h {
+            if draw_self && n.is("ScrollView") && n.content_h > n.h {
                 let track_h = (n.h - ui_px(2)).max(1);
                 let thumb_h = (track_h * n.h / n.content_h).max(ui_px(12)).min(track_h);
                 let max_thumb_y = track_h - thumb_h;
@@ -849,7 +859,7 @@ impl Warp4Engine {
                     ui_px_usize(SCROLLBAR_RADIUS),
                     palette().scrollbar_thumb,
                 );
-            } else if n.is("HorizontalScrollView") && n.content_w > n.w {
+            } else if draw_self && n.is("HorizontalScrollView") && n.content_w > n.w {
                 let track_w = (n.w - ui_px(2)).max(1);
                 let thumb_w = (track_w * n.w / n.content_w).max(ui_px(12)).min(track_w);
                 let max_thumb_x = track_w - thumb_w;

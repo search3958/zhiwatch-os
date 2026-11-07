@@ -37,7 +37,7 @@ mod ui;
 use components::*;
 use helpers::*;
 pub use model::Warp4Engine;
-use model::{Attr, ControlAnimation, Edges, Node, PaintPass, SpinnerFade};
+use model::{Attr, ControlAnimation, Edges, Node, PaintPass, SpinnerFade, MAX_DAMAGE_REGIONS};
 use parser::{
     duration_ns, ini, is_match_parent, is_safe_script_name, is_zero_dimension, parse_i32,
     parse_script, set_attr, XmlParser,
@@ -48,13 +48,13 @@ pub use ui::{set_ui_mode, set_ui_scale_percent, set_xiao_size, UiMode};
 
 const MAX_NODES: usize = 2048;
 const MAX_ACTIONS: usize = 2048;
-const SWITCH_DURATION_NS: u64 = 220_000_000;
-const RADIO_DURATION_NS: u64 = 180_000_000;
+const SWITCH_DURATION_NS: u64 = 100_000_000;
+const RADIO_DURATION_NS: u64 = 80_000_000;
 // Keep the standalone Xiao viewport in lockstep with the normal window
 // server's scroll animation. The owner differs, but the motion must not.
 const XIAO_SCROLL_ANIMATION_NS: u64 = 180_000_000;
 const XIAO_TRANSITION_NS: u64 = 180_000_000;
-const KEYBOARD_PRESS_NS: u64 = 120_000_000;
+const KEYBOARD_PRESS_NS: u64 = 55_000_000;
 #[cfg(feature = "ttf")]
 const CHECK_ICON_SVG: &str = include_str!("../files/data/ui/check-icon.svg");
 const WARP4_INPUT_RADIUS: usize = 11;

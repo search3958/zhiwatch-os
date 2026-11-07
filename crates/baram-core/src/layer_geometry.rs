@@ -1,4 +1,14 @@
 impl LayerSystem {
+    /// Reserve clip nesting storage up front for latency-sensitive renderers.
+    /// This keeps the normal layer constructor lightweight for callers that
+    /// rarely use nested clipping.
+    pub fn reserve_clip_stack(&mut self, minimum_capacity: usize) {
+        if self.clip_stack.capacity() < minimum_capacity {
+            self.clip_stack
+                .reserve(minimum_capacity.saturating_sub(self.clip_stack.len()));
+        }
+    }
+
     pub fn new(w: usize, h: usize) -> Self {
         Self {
             width: w,

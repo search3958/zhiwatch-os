@@ -4,7 +4,7 @@
 extern crate alloc;
 
 use core::panic::PanicInfo;
-use baram_core::frame::encode_frame_rle;
+use baram_core::frame::{encode_frame_rle, encode_rect_rle};
 use baram_core::text_plane::{rgb332_from_color, TextPlane};
 use baram_core::{Color, LayerSystem};
 use baram_warp4::{set_ui_mode, set_ui_scale_percent, set_xiao_size, UiMode, Warp4Engine};
@@ -24,6 +24,7 @@ const LOGICAL_HEIGHT: usize = 240;
 // complete frame band by band, so no full-screen RGB buffer is ever resident.
 // Eight rows cost 135*8*4 = 4.2 KiB instead of 126 KiB for a full 32-bit layer.
 const BAND_HEIGHT: usize = 8;
+const MAX_PENDING_DAMAGE_REGIONS: usize = 16;
 // Fallback only; the real centers are measured at boot because the ADC's
 // zero/scale and the joystick's mechanical center are not guaranteed to be
 // exactly mid-scale on every board.
@@ -34,11 +35,11 @@ const JOYSTICK_CAL_SAMPLES: usize = 16;
 const JOYSTICK_CAL_DELAY_MS: u32 = 8;
 const JOYSTICK_RECENTER_BAND: i32 = 80;
 const JOYSTICK_RECENTER_SHIFT: i32 = 4;
-const LOOP_DELAY_MS: u32 = 20;
-const FRAME_TIME_NS: u64 = LOOP_DELAY_MS as u64 * 1_000_000;
-// USB full-speed CDC sustains well under 1.5 MB/s; with RLE payloads around
-// 6 KiB this cap allows roughly 10-15 frames per second.
-const MIN_FRAME_INTERVAL_MS: u64 = 66;
+const LOOP_DELAY_MS: u32 = 4;
+// Input is polled at 250 Hz; visual updates are sent at up to 125 Hz.
+// Changed-area packets are usually far smaller than a full-frame payload.
+const MIN_FRAME_INTERVAL_MS: u64 = 8;
+const FULL_REFRESH_INTERVAL_MS: u64 = 2500;
 
 // Frame stream protocol (little-endian header, 8-bit samples):
 // magic "ZWF2" | width u16 | height u16 | flags u16 | seq u32 | payload_len u32 | crc32 u32
@@ -219,6 +220,7 @@ fn main() -> ! {
     // Shape plane: every pixel except text, 8-bit RGB332, cached until the UI
     // changes. Text lives in the band layer's text plane (3-bit coverage).
     let mut band = LayerSystem::new(LOGICAL_WIDTH, BAND_HEIGHT);
+    band.reserve_clip_stack(16);
     band.enable_text_plane(LOGICAL_WIDTH, LOGICAL_HEIGHT);
     let mut shape = alloc::vec![0u8; LOGICAL_WIDTH * LOGICAL_HEIGHT];
     let cache_bytes = shape.len()
@@ -231,6 +233,10 @@ fn main() -> ! {
     let mut seq = 0_u32;
     let mut last_frame_sent: Option<Instant> = None;
     let mut pending_send = true;
+    let mut pending_full = true;
+    let mut pending_rects = [(0_i32, 0_i32, 0_i32, 0_i32); MAX_PENDING_DAMAGE_REGIONS];
+    let mut pending_rect_count = 0usize;
+    let mut last_full_frame: Option<Instant> = None;
     let mut cache_valid = false;
     let mut stream_active = false;
 
@@ -239,10 +245,8 @@ fn main() -> ! {
     let mut previous_button_down = false;
     let mut nav_held = (0_i32, 0_i32);
     let mut nav_next_ms: Option<u64> = None;
-    // Rows of the screen that the last focus move changed, and whether the
-    // whole frame must be rebuilt instead.
-    let mut focus_damage: Option<(i32, i32)> = None;
-    let mut full_redraw = false;
+    // The engine tracks independent damaged rectangles (focus, press, hover,
+    // toggle animation). Scroll, layout and script changes mark the whole frame.
     let mut perf = Perf::default();
     let mut last_perf_ms = 0_u64;
     let mut x_adc_fault = false;
@@ -257,6 +261,10 @@ fn main() -> ! {
     let mut telemetry_pending = false;
 
     loop {
+        // Use monotonic wall time, including USB/render work. Advancing only by
+        // the nominal 4 ms sleep made animations run slow under serial load.
+        now_ns = boot_instant.elapsed().as_micros() as u64 * 1_000;
+
         // Drain host input every iteration; the viewer drives the same cursor
         // as the physical stick and sends a heartbeat while it is held.
         while let Ok(byte) = usb.read_byte() {
@@ -276,6 +284,8 @@ fn main() -> ! {
                         // The next frame re-renders every band with the new
                         // sample conversion; there is no cached framebuffer.
                         pending_send = true;
+                        pending_full = true;
+                        pending_rect_count = 0;
                     }
                 }
                 Some(HostPacket::Command { command, arg }) => match command {
@@ -393,10 +403,10 @@ fn main() -> ! {
         } else if (nav_x, nav_y) != nav_held {
             nav_held = (nav_x, nav_y);
             nav_next_ms = Some(now_ms + NAV_FIRST_REPEAT_MS);
-            move_focus(&mut engine, nav_x, nav_y, &mut focus_damage, &mut full_redraw);
+            move_focus(&mut engine, nav_x, nav_y);
         } else if nav_next_ms.is_some_and(|due| now_ms >= due) {
             nav_next_ms = Some(now_ms + NAV_REPEAT_MS);
-            move_focus(&mut engine, nav_x, nav_y, &mut focus_damage, &mut full_redraw);
+            move_focus(&mut engine, nav_x, nav_y);
         }
 
         // Button press activates the focused control, like Space. Activation
@@ -406,7 +416,6 @@ fn main() -> ! {
             || virtual_button;
         if button_down && !previous_button_down {
             if engine.activate_focused() {
-                full_redraw = true;
                 esp_println::println!("[input] focused control activated");
             }
         } else if !button_down && previous_button_down {
@@ -414,58 +423,114 @@ fn main() -> ! {
         }
         previous_button_down = button_down;
 
-        // The planes are rebuilt only when the UI changed. A focus move repaints
-        // only the rows it touched (the old and new control), unless scrolling
-        // is involved; then the whole frame is rebuilt.
-        if engine.is_dirty() || !cache_valid || full_redraw {
+        // Keep the cached planes intact and repaint only the exact damaged
+        // rectangles. Focus moving between distant controls stays as two small
+        // regions instead of one large bounding box.
+        if engine.is_dirty() || !cache_valid {
             let started = Instant::now();
-            match focus_damage.take() {
-                Some((y0, y1)) if cache_valid && !full_redraw && !engine.is_animating() => {
-                    rebuild_rows(&mut engine, &mut band, &mut shape, y0, y1);
+            let mut changed_rects = [(0_i32, 0_i32, 0_i32, 0_i32); MAX_PENDING_DAMAGE_REGIONS];
+            let damage = engine.take_damage_rects(&mut changed_rects);
+            match damage {
+                Some(count) if cache_valid && count > 0 => {
+                    for rect in changed_rects.iter().take(count).copied() {
+                        rebuild_rect(&mut engine, &mut band, &mut shape, rect);
+                        if !pending_full {
+                            add_pending_rect(
+                                &mut pending_rects,
+                                &mut pending_rect_count,
+                                rect,
+                            );
+                        }
+                    }
                     perf.partial_rebuilds += 1;
                 }
                 _ => {
                     rebuild_cache(&mut engine, &mut band, &mut shape);
+                    pending_full = true;
+                    pending_rect_count = 0;
                     perf.full_rebuilds += 1;
                 }
             }
             perf.rebuild_us += started.elapsed().as_micros() as u64;
-            full_redraw = false;
             cache_valid = true;
-            pending_send = true;
+            pending_send = pending_send || pending_full || pending_rect_count > 0;
         }
 
-        // Transmit at most once per MIN_FRAME_INTERVAL_MS.
-        if pending_send {
+        // A periodic keyframe repairs the host image after a dropped/corrupt
+        // USB packet; normal interactions transfer only their changed pixels.
+        let keyframe_due = last_full_frame
+            .map(|sent| sent.elapsed().as_millis() >= FULL_REFRESH_INTERVAL_MS)
+            .unwrap_or(true);
+        if cache_valid && keyframe_due {
+            pending_send = true;
+            pending_full = true;
+            pending_rect_count = 0;
+        }
+
+        // Small delta packets make a 60 Hz target practical on this display.
+        if pending_send
+            && last_frame_sent
+                .map(|sent| sent.elapsed().as_millis() >= MIN_FRAME_INTERVAL_MS)
+                .unwrap_or(true)
+        {
             let started = Instant::now();
-            let attempt = try_send(
-                &mut usb,
-                &shape,
-                band.text_plane(),
-                cursor_x,
-                cursor_y,
-                &mut seq,
-                &mut last_frame_sent,
-                chroma_carrier_mode,
-            );
-            if let Some(true) = attempt {
-                perf.send_us += started.elapsed().as_micros() as u64;
-                perf.frames += 1;
-            }
-            match attempt {
-                Some(sent) => {
-                    pending_send = !sent;
-                    if sent != stream_active {
-                        if sent {
-                            esp_println::println!("[ok] USB stream active (frame {})", seq);
-                        } else {
-                            esp_println::println!("[wait] USB host stalled; holding frames");
-                        }
-                        stream_active = sent;
+            let full_frame = pending_full || chroma_carrier_mode;
+            let mut sent = true;
+            if full_frame {
+                seq = seq.wrapping_add(1);
+                sent = send_frame(
+                    &mut usb,
+                    &shape,
+                    band.text_plane(),
+                    cursor_x,
+                    cursor_y,
+                    seq,
+                    chroma_carrier_mode,
+                );
+                if sent {
+                    last_full_frame = Some(Instant::now());
+                }
+            } else {
+                for rect in pending_rects.iter().take(pending_rect_count).copied() {
+                    seq = seq.wrapping_add(1);
+                    if !send_delta(
+                        &mut usb,
+                        &shape,
+                        band.text_plane(),
+                        rect,
+                        seq,
+                    ) {
+                        sent = false;
+                        break;
                     }
                 }
-                // Throttled: send when the next frame is due.
-                None => {}
+                if sent && pending_rect_count > 0 {
+                    let mut last_progress = Instant::now();
+                    sent = flush_nb(&mut usb, &mut last_progress);
+                }
+            }
+            last_frame_sent = Some(Instant::now());
+            perf.send_us += started.elapsed().as_micros() as u64;
+            if sent {
+                perf.frames += 1;
+                pending_send = false;
+                pending_full = false;
+                pending_rect_count = 0;
+            } else {
+                // A timed-out write may have left a truncated packet in the
+                // stream. Recover with a complete keyframe instead of retrying
+                // a delta whose prefix may already have reached the host.
+                pending_send = true;
+                pending_full = true;
+                pending_rect_count = 0;
+            }
+            if sent != stream_active {
+                if sent {
+                    esp_println::println!("[ok] USB stream active (frame {})", seq);
+                } else {
+                    esp_println::println!("[wait] USB host stalled; holding frames");
+                }
+                stream_active = sent;
             }
         }
 
@@ -514,31 +579,7 @@ fn main() -> ! {
         }
 
         delay.delay_millis(LOOP_DELAY_MS);
-        now_ns = now_ns.saturating_add(FRAME_TIME_NS);
     }
-}
-
-/// Throttled frame attempt: `None` while the minimum frame interval has not
-/// elapsed, `Some(sent)` once an attempt was actually made.
-fn try_send(
-    usb: &mut UsbSerialJtag<'_, Blocking>,
-    shape: &[u8],
-    text: Option<&TextPlane>,
-    cursor_x: i32,
-    cursor_y: i32,
-    seq: &mut u32,
-    last_frame_sent: &mut Option<Instant>,
-    chroma_carrier: bool,
-) -> Option<bool> {
-    if let Some(sent_at) = *last_frame_sent {
-        if sent_at.elapsed().as_millis() < MIN_FRAME_INTERVAL_MS {
-            return None;
-        }
-    }
-    *seq = seq.wrapping_add(1);
-    let ok = send_frame(usb, shape, text, cursor_x, cursor_y, *seq, chroma_carrier);
-    *last_frame_sent = Some(Instant::now());
-    Some(ok)
 }
 
 fn axis_step(raw: i32, center: i32) -> i32 {
@@ -824,32 +865,11 @@ fn dominant_direction(dx: i32, dy: i32) -> (i32, i32) {
     }
 }
 
-/// Move focus one control in a direction. Records the screen rows that change
-/// (the old and new control) so only those bands are repainted. A scroll
-/// starts a full rebuild, because the whole content moves.
-fn move_focus(
-    engine: &mut Warp4Engine,
-    dx: i32,
-    dy: i32,
-    damage: &mut Option<(i32, i32)>,
-    full_redraw: &mut bool,
-) {
-    let before = engine.keyboard_focus_rect();
-    let scroll_before = engine.scroll_position();
-    if !engine.focus_spatial(dx, dy) {
-        return;
-    }
-    if engine.scroll_position() != scroll_before {
-        *full_redraw = true;
-        return;
-    }
-    for (_, y, _, h) in [before, engine.keyboard_focus_rect()].into_iter().flatten() {
-        let (y0, y1) = (y, y + h);
-        *damage = Some(match *damage {
-            Some((a, b)) => (a.min(y0), b.max(y1)),
-            None => (y0, y1),
-        });
-    }
+/// Move focus one control in a direction. The engine accumulates the damaged
+/// rows (old and new control) internally; a focus move that also scrolls marks
+/// the whole frame damaged inside `set_scroll`.
+fn move_focus(engine: &mut Warp4Engine, dx: i32, dy: i32) {
+    engine.focus_spatial(dx, dy);
 }
 
 /// Rebuild the shape plane and text plane for every band (full frame).
@@ -857,23 +877,98 @@ fn rebuild_cache(engine: &mut Warp4Engine, band: &mut LayerSystem, shape: &mut [
     if engine.is_dirty() {
         engine.update(LOGICAL_WIDTH as i32, LOGICAL_HEIGHT as i32);
     }
+    if let Some(text) = band.text_plane_mut() {
+        text.clear_all();
+    }
     let mut band_y = 0usize;
     while band_y < LOGICAL_HEIGHT {
         rebuild_band(engine, band, shape, band_y);
         band_y += BAND_HEIGHT;
     }
+    engine.clear_damage();
 }
 
-/// Rebuild only the bands that overlap screen rows `y0..y1`.
-fn rebuild_rows(engine: &mut Warp4Engine, band: &mut LayerSystem, shape: &mut [u8], y0: i32, y1: i32) {
+/// Rebuild only the pixels inside one screen-space damage rectangle.
+fn rebuild_rect(
+    engine: &mut Warp4Engine,
+    band: &mut LayerSystem,
+    shape: &mut [u8],
+    rect: (i32, i32, i32, i32),
+) {
     if engine.is_dirty() {
         engine.update(LOGICAL_WIDTH as i32, LOGICAL_HEIGHT as i32);
     }
-    let end = y1.clamp(0, LOGICAL_HEIGHT as i32) as usize;
-    let mut band_y = (y0.clamp(0, LOGICAL_HEIGHT as i32) as usize / BAND_HEIGHT) * BAND_HEIGHT;
-    while band_y < end {
-        rebuild_band(engine, band, shape, band_y);
+    let (x, y, w, h) = rect;
+    let x0 = x.clamp(0, LOGICAL_WIDTH as i32) as usize;
+    let x1 = x.saturating_add(w).clamp(0, LOGICAL_WIDTH as i32) as usize;
+    let y0 = y.clamp(0, LOGICAL_HEIGHT as i32) as usize;
+    let y1 = y.saturating_add(h).clamp(0, LOGICAL_HEIGHT as i32) as usize;
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    let mut band_y = (y0 / BAND_HEIGHT) * BAND_HEIGHT;
+    while band_y < y1 {
+        let rows = BAND_HEIGHT.min(LOGICAL_HEIGHT - band_y);
+        let local_y0 = y0.saturating_sub(band_y).min(rows);
+        let local_y1 = y1.saturating_sub(band_y).min(rows);
+        band.push_clip(x0, local_y0, x1, local_y1);
+        band.set_text_region(band_y, x0, local_y0, x1, local_y1);
+        engine.draw_band_to_layer(band, band_y as i32);
+        band.pop_clip();
+
+        let pixels = band.buf_ref();
+        for local_y in local_y0..local_y1 {
+            let frame_y = band_y + local_y;
+            let dst_start = frame_y * LOGICAL_WIDTH + x0;
+            let src_start = local_y * LOGICAL_WIDTH + x0;
+            let dst = &mut shape[dst_start..dst_start + (x1 - x0)];
+            for (offset, out) in dst.iter_mut().enumerate() {
+                *out = rgb332_from_color(Color(pixels[src_start + offset]));
+            }
+        }
         band_y += BAND_HEIGHT;
+    }
+}
+
+/// Merge a new unsent rectangle into the bounded packet list. Overflow
+/// promotes the pending update to a full keyframe instead of dropping pixels.
+fn add_pending_rect(
+    rects: &mut [(i32, i32, i32, i32); MAX_PENDING_DAMAGE_REGIONS],
+    count: &mut usize,
+    mut merged: (i32, i32, i32, i32),
+) {
+    let mut i = 0;
+    while i < *count {
+        let other = rects[i];
+        let right = merged.0.saturating_add(merged.2);
+        let bottom = merged.1.saturating_add(merged.3);
+        let other_right = other.0.saturating_add(other.2);
+        let other_bottom = other.1.saturating_add(other.3);
+        if merged.0 <= other_right
+            && right >= other.0
+            && merged.1 <= other_bottom
+            && bottom >= other.1
+        {
+            let x0 = merged.0.min(other.0);
+            let y0 = merged.1.min(other.1);
+            let x1 = right.max(other_right);
+            let y1 = bottom.max(other_bottom);
+            merged = (x0, y0, x1 - x0, y1 - y0);
+            *count -= 1;
+            rects[i] = rects[*count];
+            i = 0;
+        } else {
+            i += 1;
+        }
+    }
+    if *count < rects.len() {
+        rects[*count] = merged;
+        *count += 1;
+    } else {
+        *count = 0;
+        rects[0] = (0, 0, LOGICAL_WIDTH as i32, LOGICAL_HEIGHT as i32);
+        *count = 1;
     }
 }
 
@@ -891,6 +986,90 @@ fn rebuild_band(engine: &mut Warp4Engine, band: &mut LayerSystem, shape: &mut [u
             *out = rgb332_from_color(Color(pixels[row * LOGICAL_WIDTH + x]));
         }
     }
+}
+
+/// Send only one changed rectangle. The host applies it to its cached frame.
+fn send_delta(
+    usb: &mut UsbSerialJtag<'_, Blocking>,
+    shape: &[u8],
+    text: Option<&TextPlane>,
+    rect: (i32, i32, i32, i32),
+    seq: u32,
+) -> bool {
+    let x = rect.0.clamp(0, LOGICAL_WIDTH as i32) as usize;
+    let y = rect.1.clamp(0, LOGICAL_HEIGHT as i32) as usize;
+    let right = rect.0.saturating_add(rect.2).clamp(0, LOGICAL_WIDTH as i32) as usize;
+    let bottom = rect.1.saturating_add(rect.3).clamp(0, LOGICAL_HEIGHT as i32) as usize;
+    if x >= right || y >= bottom {
+        return true;
+    }
+    let patch = (x, y, right - x, bottom - y);
+    let mut payload_len = 0u32;
+    let mut crc = 0xFFFF_FFFF_u32;
+    encode_rect_rle(
+        shape,
+        text,
+        LOGICAL_WIDTH,
+        LOGICAL_HEIGHT,
+        patch,
+        (NO_CURSOR, NO_CURSOR),
+        &mut |count, sample| {
+            crc = crc32_byte(crc, count);
+            crc = crc32_byte(crc, sample);
+            payload_len += 2;
+        },
+    );
+    let crc = !crc;
+
+    // ZWD1: magic, full W/H, rect X/Y/W/H, flags, sequence, payload length, CRC.
+    let mut header = [0_u8; 30];
+    header[0..4].copy_from_slice(b"ZWD1");
+    header[4..6].copy_from_slice(&(LOGICAL_WIDTH as u16).to_le_bytes());
+    header[6..8].copy_from_slice(&(LOGICAL_HEIGHT as u16).to_le_bytes());
+    header[8..10].copy_from_slice(&(x as u16).to_le_bytes());
+    header[10..12].copy_from_slice(&(y as u16).to_le_bytes());
+    header[12..14].copy_from_slice(&((right - x) as u16).to_le_bytes());
+    header[14..16].copy_from_slice(&((bottom - y) as u16).to_le_bytes());
+    header[16..18].copy_from_slice(&(FRAME_FLAG_RLE | FRAME_FLAG_8BIT).to_le_bytes());
+    header[18..22].copy_from_slice(&seq.to_le_bytes());
+    header[22..26].copy_from_slice(&payload_len.to_le_bytes());
+    header[26..30].copy_from_slice(&crc.to_le_bytes());
+
+    let mut last_progress = Instant::now();
+    if !write_all_nb(usb, &header, &mut last_progress) {
+        return false;
+    }
+
+    let mut chunk = [0_u8; 256];
+    let mut used = 0usize;
+    let mut ok = true;
+    encode_rect_rle(
+        shape,
+        text,
+        LOGICAL_WIDTH,
+        LOGICAL_HEIGHT,
+        patch,
+        (NO_CURSOR, NO_CURSOR),
+        &mut |count, sample| {
+            if !ok {
+                return;
+            }
+            chunk[used] = count;
+            chunk[used + 1] = sample;
+            used += 2;
+            if used == chunk.len() {
+                ok = write_all_nb(usb, &chunk, &mut last_progress);
+                used = 0;
+            }
+        },
+    );
+    if !ok {
+        return false;
+    }
+    if used > 0 && !write_all_nb(usb, &chunk[..used], &mut last_progress) {
+        return false;
+    }
+    true
 }
 
 /// Transmit one frame. The RLE stream is produced twice: first to learn the

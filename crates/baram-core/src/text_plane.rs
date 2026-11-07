@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 /// Maximum number of text draw calls tracked per frame. Calls beyond this
 /// still draw their coverage, but their pixels fall back to black.
-pub const TEXT_RUN_CAPACITY: usize = 160;
+pub const TEXT_RUN_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct TextRun {
@@ -104,11 +104,120 @@ impl TextPlane {
         self.cov[byte + 1] = (word >> 8) as u8;
     }
 
-    /// Start a new band pass at absolute row `origin_y`. Run registration
-    /// restarts here; the run table is rebuilt identically by every band.
+    /// Start a new isolated band pass at absolute row `origin_y`.
+    /// Kept for callers that intentionally rebuild the run table from scratch.
     pub fn begin_band(&mut self, origin_y: usize) {
         self.origin_y = origin_y;
         self.run_count = 0;
+    }
+
+    /// Begin repainting one band-local region. Old color runs are clipped to
+    /// the unchanged area outside it, and pixel coverage inside it is cleared.
+    /// This preserves outside colors without retaining stale metadata.
+    pub fn begin_region(
+        &mut self,
+        origin_y: usize,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+    ) {
+        self.origin_y = origin_y;
+        let x0 = x0.min(self.width) as i32;
+        let x1 = x1.min(self.width) as i32;
+        let local_y0 = y0.min(self.height.saturating_sub(origin_y));
+        let local_y1 = y1.min(self.height.saturating_sub(origin_y));
+        let abs_y0 = origin_y.saturating_add(local_y0).min(self.height) as i32;
+        let abs_y1 = origin_y.saturating_add(local_y1).min(self.height) as i32;
+        if x0 >= x1 || abs_y0 >= abs_y1 {
+            return;
+        }
+
+        // Remove only the part of each old color run covered by this repaint.
+        // Runs extending outside the clip are split into up to four pieces;
+        // this preserves their old color outside while preventing stale runs
+        // from accumulating after repeated small updates. The fixed run buffer
+        // is reused in place, so this path performs no allocation.
+        let mut count = self.run_count.min(self.runs.len());
+        let mut read = 0usize;
+        while read < count {
+            let run = self.runs[read];
+            let rx0 = run.x0 as i32;
+            let ry0 = run.y0 as i32;
+            let rx1 = run.x1 as i32;
+            let ry1 = run.y1 as i32;
+            let ix0 = rx0.max(x0);
+            let iy0 = ry0.max(abs_y0);
+            let ix1 = rx1.min(x1);
+            let iy1 = ry1.min(abs_y1);
+            if ix0 >= ix1 || iy0 >= iy1 {
+                read += 1;
+                continue;
+            }
+
+            let mut pieces = [TextRun::default(); 4];
+            let mut piece_count = 0usize;
+            if ry0 < iy0 {
+                pieces[piece_count] = TextRun {
+                    x0: run.x0,
+                    y0: run.y0,
+                    x1: run.x1,
+                    y1: iy0 as i16,
+                    color: run.color,
+                };
+                piece_count += 1;
+            }
+            if iy1 < ry1 {
+                pieces[piece_count] = TextRun {
+                    x0: run.x0,
+                    y0: iy1 as i16,
+                    x1: run.x1,
+                    y1: run.y1,
+                    color: run.color,
+                };
+                piece_count += 1;
+            }
+            if rx0 < ix0 {
+                pieces[piece_count] = TextRun {
+                    x0: run.x0,
+                    y0: iy0 as i16,
+                    x1: ix0 as i16,
+                    y1: iy1 as i16,
+                    color: run.color,
+                };
+                piece_count += 1;
+            }
+            if ix1 < rx1 {
+                pieces[piece_count] = TextRun {
+                    x0: ix1 as i16,
+                    y0: iy0 as i16,
+                    x1: run.x1,
+                    y1: iy1 as i16,
+                    color: run.color,
+                };
+                piece_count += 1;
+            }
+
+            // If the bounded run table is full, keeping the original run is
+            // still safe: coverage inside this clip is cleared below, and any
+            // newly drawn text run is appended later and takes precedence.
+            let new_count = count - 1 + piece_count;
+            if new_count <= self.runs.len() {
+                self.runs.copy_within(read + 1..count, read + piece_count);
+                for (offset, piece) in pieces.iter().take(piece_count).copied().enumerate() {
+                    self.runs[read + offset] = piece;
+                }
+                count = new_count;
+                read += piece_count;
+            } else {
+                read += 1;
+            }
+        }
+        self.run_count = count;
+
+        // Coverage is pixel data, so clear it independently from color runs.
+        // The subsequent clipped render repopulates only the changed pixels.
+        self.clear_local_rect(x0 as usize, local_y0, x1 as usize, local_y1);
     }
 
     /// Register one text draw call. Coordinates are band-local.
@@ -249,10 +358,27 @@ impl LayerSystem {
     }
 
     /// Select the absolute frame row where this band starts. Call before each
-    /// band pass.
+    /// full-width band pass; run metadata outside the band is preserved.
     pub fn set_text_origin(&mut self, frame_y: usize) {
+        let width = self.width;
+        let height = self.height;
         if let Some(plane) = self.text.as_mut() {
-            plane.begin_band(frame_y);
+            plane.begin_region(frame_y, 0, 0, width, height);
+        }
+    }
+
+    /// Select an absolute frame row and the exact band-local clip that will be
+    /// repainted. Color metadata outside this region remains untouched.
+    pub fn set_text_region(
+        &mut self,
+        frame_y: usize,
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+    ) {
+        if let Some(plane) = self.text.as_mut() {
+            plane.begin_region(frame_y, x0, y0, x1, y1);
         }
     }
 
@@ -275,6 +401,14 @@ impl LayerSystem {
 
     /// Register a text draw call (band-local bounds) with its color.
     pub fn text_begin_run(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) {
+        let (clip_x0, clip_y0, clip_x1, clip_y1) = self.clip_bounds();
+        let x0 = x0.max(clip_x0 as i32);
+        let y0 = y0.max(clip_y0 as i32);
+        let x1 = x1.min(clip_x1 as i32);
+        let y1 = y1.min(clip_y1 as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
         if let Some(plane) = self.text.as_mut() {
             plane.begin_run(x0, y0, x1, y1, rgb332_from_color(color));
         }
@@ -360,6 +494,54 @@ mod tests {
         assert_eq!(plane.color_at(2, 2), Some(0xE0));
         assert_eq!(plane.color_at(7, 7), Some(0x1C));
         assert_eq!(plane.color_at(18, 18), None);
+    }
+
+    #[test]
+    fn partial_region_keeps_unmodified_text_colors() {
+        let mut plane = TextPlane::new(20, 20);
+        plane.begin_band(0);
+        plane.begin_run(0, 1, 8, 6, 0xE0);
+        plane.begin_region(8, 0, 0, 20, 8);
+        plane.begin_run(10, 1, 18, 6, 0x1C);
+        assert_eq!(plane.color_at(2, 2), Some(0xE0));
+        assert_eq!(plane.color_at(12, 10), Some(0x1C));
+
+        // Repainting a small part removes fully-contained runs only.
+        plane.begin_region(0, 0, 0, 9, 8);
+        assert_eq!(plane.color_at(2, 2), None);
+        assert_eq!(plane.color_at(12, 10), Some(0x1C));
+        plane.begin_run(0, 1, 8, 6, 0x20);
+        assert_eq!(plane.color_at(2, 2), Some(0x20));
+    }
+
+    #[test]
+    fn partial_repaint_preserves_color_outside_clip() {
+        let mut plane = TextPlane::new(20, 8);
+        plane.begin_band(0);
+        plane.begin_run(0, 1, 20, 6, 0xE0);
+        plane.put_coverage(5, 2, 7);
+        plane.put_coverage(15, 2, 7);
+        plane.begin_region(0, 0, 0, 10, 8);
+        assert_eq!(plane.coverage(5, 2), 0);
+        assert_eq!(plane.coverage(15, 2), 7);
+        assert_eq!(plane.color_at(5, 2), None);
+        assert_eq!(plane.color_at(15, 2), Some(0xE0));
+        plane.begin_run(0, 1, 10, 6, 0x1C);
+        assert_eq!(plane.color_at(5, 2), Some(0x1C));
+        assert_eq!(plane.color_at(15, 2), Some(0xE0));
+    }
+
+    #[test]
+    fn layer_text_run_is_clipped_to_active_region() {
+        use crate::layer::LayerSystem;
+        let mut layer = LayerSystem::new(20, 8);
+        layer.enable_text_plane(20, 8);
+        layer.push_clip(0, 0, 10, 8);
+        layer.text_begin_run(0, 1, 20, 6, Color::rgb(255, 0, 0));
+        layer.pop_clip();
+        let plane = layer.text_plane().unwrap();
+        assert!(plane.color_at(5, 2).is_some());
+        assert_eq!(plane.color_at(15, 2), None);
     }
 
     #[test]

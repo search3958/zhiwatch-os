@@ -59,7 +59,7 @@ The screen is cached as two planes, so cursor motion does not repaint the UI:
 * **Shape plane**: 135x240 8-bit RGB332, 32,400 bytes. Everything except text.
 * **Text plane**: 135x240 3-bit coverage, bit-packed, 12,150 bytes. Glyph color is not
   stored per pixel; each text draw call is recorded as a run (bounding box + RGB332
-  color), at most 160 per frame.
+  color), at most 256 draw calls across the complete frame.
 * **Band scratch**: 8 rows of 32-bit pixels, 4,320 bytes, used only while rebuilding.
 * **Font**: the TTF is copied to RAM, about 9.7 KB.
 
@@ -69,12 +69,18 @@ over the shape with its coverage, and the cursor is drawn on top. Nothing is
 composed into a third buffer. A later opaque shape write removes the text beneath
 it (z-order is kept); translucent writes (shadows, global alpha) leave text visible.
 
-Approximate RAM: 32.4 KB shape + 12.2 KB text + 9.7 KB font + 4.3 KB band + glyph
-caches. This is well under the 100 KB budget.
+The focus cache reserves two node-indexed arrays up front (candidate list and
+node-to-position map): about 16 KiB at the 2,048-node limit on the ESP32-C3.
+This avoids heap growth and linear lookup during focus navigation. The control
+animation queue also reserves 64 entries in advance.
+
+Approximate RAM: 32.4 KB shape + 12.2 KB text + 9.7 KB font + 4.3 KB band +
+16 KiB focus cache + glyph caches. This remains within the 100 KB target.
 
 ## Frame stream protocol
 
-Frames are pushed over USB Serial/JTAG with a little-endian header:
+Frames are pushed over USB Serial/JTAG with little-endian headers. A full
+keyframe uses:
 
 ```
 magic "ZWF2" | width u16 | height u16 | flags u16 | seq u32 |
@@ -87,10 +93,21 @@ payload_len u32 | crc32 u32
 * `flags` bit1: Chroma subcarrier modulation mode (Y luminance base with chroma C modulated on subcarrier).
 * `flags` bit2: 8-bit color mode (RGB332).
 * `crc32` is the standard CRC-32 of the payload bytes as transmitted.
-* The frame is sent when the UI redraws or the cursor moves, throttled to at most one
-  per `MIN_FRAME_INTERVAL_MS` (66 ms). The UI is only repainted when it is dirty.
-* The RLE payload is produced twice per frame: once to get the length and CRC, once
-  to send. No frame buffer is needed for either pass.
+
+Small changes use a `ZWD1` patch packet instead of re-sending the complete frame:
+
+```
+magic "ZWD1" | frame_w u16 | frame_h u16 | rect_x u16 | rect_y u16 |
+rect_w u16 | rect_h u16 | flags u16 | seq u32 | payload_len u32 | crc32 u32
+```
+
+Its RLE payload contains only the rectangle's pixels, in row-major order. The
+viewer applies it to the cached keyframe. A complete `ZWF2` keyframe is sent on
+startup, after full invalidation, and every 2.5 seconds to recover from a dropped
+patch. Updates are capped at one every 8 ms (up to 125 Hz), while input is polled
+every 4 ms. Only damaged rectangles are repainted and transmitted during ordinary
+focus, press, hover, and control-animation changes. The RLE payload is streamed
+twice (for CRC/length, then for transmission); no additional frame buffer is needed.
 
 `tools/zhiwatch_viewer.py` implements the receiving side (pure Python, tkinter +
 pyserial, no other dependencies). Press **C** or click the **CHROMA CARRIER** button
@@ -113,11 +130,12 @@ on-screen positions of the controls. Holding a direction repeats after 380 ms an
 then every 170 ms. The button activates the focused control, like Space. The
 focused control is outlined with a light 1-pixel frame on Xiao.
 
-Only the rows of the old and new control are repainted after a focus move. A
-scroll (the focused control was off-screen) or any other UI change rebuilds the
-whole frame. Every 2 seconds the firmware logs a `[perf]` line with the frame rate,
-full and partial rebuild counts, and the average rebuild and send times in
-microseconds.
+Only the old and new controls' damaged rectangles are repainted after a focus
+move; distant controls remain separate regions rather than becoming one large
+bounding box. A scroll (the focused control was off-screen) or a UI change that
+can affect arbitrary nodes rebuilds the whole frame. Every 2 seconds the firmware
+logs a `[perf]` line with the frame rate, full and partial rebuild counts, and the
+average rebuild and send times in microseconds.
 
 ## Virtual joystick (host input)
 

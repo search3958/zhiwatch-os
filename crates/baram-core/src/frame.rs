@@ -151,6 +151,40 @@ pub fn encode_frame_rle(
     rle.finish(emit);
 }
 
+/// Encode only a rectangular region while sampling from the original full-frame
+/// planes. Coordinates in the packet remain absolute; samples are emitted in
+/// row-major order within the rectangle.
+pub fn encode_rect_rle(
+    shape: &[u8],
+    text: Option<&TextPlane>,
+    width: usize,
+    height: usize,
+    rect: (usize, usize, usize, usize),
+    cursor: (i32, i32),
+    emit: &mut impl FnMut(u8, u8),
+) {
+    let (x0, y0, rect_w, rect_h) = rect;
+    if width == 0
+        || height == 0
+        || x0 >= width
+        || y0 >= height
+        || rect_w == 0
+        || rect_h == 0
+        || shape.len() < width.saturating_mul(height)
+    {
+        return;
+    }
+    let x1 = x0.saturating_add(rect_w).min(width);
+    let y1 = y0.saturating_add(rect_h).min(height);
+    let mut rle = Rle8::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            rle.push(frame_sample(shape, text, width, x, y, cursor, false), emit);
+        }
+    }
+    rle.finish(emit);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +229,27 @@ mod tests {
         }
         rle.finish(&mut |c, v| entries.push((c, v)));
         assert_eq!(entries, vec![(255, 7), (255, 7), (90, 7)]);
+    }
+
+    #[test]
+    fn rect_encoder_matches_frame_subregion() {
+        let w = 11;
+        let h = 7;
+        let mut shape = vec![0u8; w * h];
+        for (i, v) in shape.iter_mut().enumerate() {
+            *v = (i * 29 % 256) as u8;
+        }
+        let rect = (3, 2, 5, 4);
+        let mut entries = Vec::new();
+        encode_rect_rle(&shape, None, w, h, rect, (-1000, -1000), &mut |c, v| {
+            entries.push((c, v));
+        });
+        let decoded = decode(&entries);
+        let mut expected = Vec::new();
+        for y in rect.1..rect.1 + rect.3 {
+            expected.extend_from_slice(&shape[y * w + rect.0..y * w + rect.0 + rect.2]);
+        }
+        assert_eq!(decoded, expected);
     }
 
     #[test]

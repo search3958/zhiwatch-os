@@ -7,6 +7,14 @@ The firmware streams frames over USB Serial/JTAG with this framing
     magic "ZWF2" | width u16 | height u16 | flags u16 | seq u32 |
     payload_len u32 | crc32 u32
 
+Changed rectangles use a smaller patch packet:
+
+    magic "ZWD1" | frame_w u16 | frame_h u16 | rect_x/y/w/h u16 |
+    flags u16 | seq u32 | payload_len u32 | crc32 u32
+
+The viewer applies each decoded patch to its last complete keyframe. A periodic
+full keyframe repairs the image if a patch packet is lost.
+
 flags bit0: payload is RLE with entries (run_count u8, sample u8); the firmware
 always sends this lossless form.
 flags bit2: samples are 8-bit RGB332 (3 bits red, 3 bits green, 2 bits blue).
@@ -54,8 +62,11 @@ import time
 import zlib
 
 MAGIC = b"ZWF2"
-# magic, w, h, flags, seq, payload_len, crc32
+DELTA_MAGIC = b"ZWD1"
+# Full frame: magic, w, h, flags, seq, payload_len, crc32
 HEADER = struct.Struct("<4sHHHIII")
+# Delta: magic, frame_w/h, rect_x/y/w/h, flags, seq, payload_len, crc32
+DELTA_HEADER = struct.Struct("<4sHHHHHHHIII")
 FLAG_RLE = 1
 FLAG_CHROMA_CARRIER = 2
 FLAG_8BIT = 4
@@ -236,6 +247,8 @@ class FrameParser:
 
     def __init__(self):
         self.buf = bytearray()
+        self._frame_size = None
+        self._frame_rgb = None
         self.frames = 0
         self.crc_errors = 0
         self.bad_headers = 0
@@ -246,12 +259,16 @@ class FrameParser:
         self.telemetry_packets = 0
         self.on_log = None  # callback(str) for non-frame bytes (firmware logs)
         self._pending = None  # newest (width, height, rgb) awaiting pull
+        self._pending_delta = False
         self._log_tail = b""
 
     def reset_stream(self):
         """Forget buffered bytes/state after the serial device reconnects."""
         self.buf.clear()
         self._pending = None
+        self._pending_delta = False
+        self._frame_size = None
+        self._frame_rgb = None
         self._log_tail = b""
         self.seq = None
         self.telemetry = None
@@ -270,14 +287,19 @@ class FrameParser:
     def feed(self, data: bytes):
         self.buf.extend(data)
         while True:
-            frame_idx = self.buf.find(MAGIC)
+            full_idx = self.buf.find(MAGIC)
+            delta_idx = self.buf.find(DELTA_MAGIC)
             telemetry_idx = self.buf.find(TELEMETRY_MAGIC)
-            if frame_idx < 0 and telemetry_idx < 0:
-                # Keep a possible partial magic at the tail.
-                keep = max(len(self.buf) - (len(MAGIC) - 1), 0)
+            packet_candidates = [idx for idx in (full_idx, delta_idx) if idx >= 0]
+            packet_idx = min(packet_candidates) if packet_candidates else -1
+
+            if packet_idx < 0 and telemetry_idx < 0:
+                # Keep a possible partial four-byte magic at the tail.
+                keep = max(len(self.buf) - 3, 0)
                 self._flush_prefix(keep)
                 return
-            if telemetry_idx >= 0 and (frame_idx < 0 or telemetry_idx < frame_idx):
+
+            if telemetry_idx >= 0 and (packet_idx < 0 or telemetry_idx < packet_idx):
                 if len(self.buf) < telemetry_idx + TELEMETRY.size:
                     self._flush_prefix(telemetry_idx)
                     return
@@ -311,7 +333,80 @@ class FrameParser:
                     uptime_ms,
                 )
                 continue
-            idx = frame_idx
+
+            if packet_idx == delta_idx:
+                if len(self.buf) < packet_idx + DELTA_HEADER.size:
+                    self._flush_prefix(packet_idx)
+                    return
+                (
+                    magic,
+                    frame_w,
+                    frame_h,
+                    rect_x,
+                    rect_y,
+                    rect_w,
+                    rect_h,
+                    flags,
+                    seq,
+                    plen,
+                    crc,
+                ) = DELTA_HEADER.unpack_from(self.buf, packet_idx)
+                valid_frame = 0 < frame_w <= MAX_DIM and 0 < frame_h <= MAX_DIM
+                valid_rect = (
+                    rect_w > 0
+                    and rect_h > 0
+                    and rect_x + rect_w <= frame_w
+                    and rect_y + rect_h <= frame_h
+                )
+                valid_flags = flags == (FLAG_RLE | FLAG_8BIT)
+                max_payload = rect_w * rect_h * 2
+                if (
+                    magic != DELTA_MAGIC
+                    or not valid_frame
+                    or not valid_rect
+                    or not valid_flags
+                    or not 0 < plen <= max_payload
+                ):
+                    self.bad_headers += 1
+                    self._flush_prefix(packet_idx + 1)
+                    continue
+                packet_end = packet_idx + DELTA_HEADER.size + plen
+                if len(self.buf) < packet_end:
+                    self._flush_prefix(packet_idx)
+                    return
+                payload = bytes(self.buf[packet_idx + DELTA_HEADER.size : packet_end])
+                if zlib.crc32(payload) & 0xFFFFFFFF != crc:
+                    self.crc_errors += 1
+                    self._flush_prefix(packet_idx + 1)
+                    continue
+                del self.buf[:packet_end]
+                self.payload_bytes += plen
+                try:
+                    patch = rle_decode_8bit(payload)
+                except ValueError:
+                    self.bad_headers += 1
+                    continue
+                if len(patch) != rect_w * rect_h:
+                    self.bad_headers += 1
+                    continue
+                if self._frame_size != (frame_w, frame_h) or self._frame_rgb is None:
+                    # A delta cannot initialize a display; wait for the next keyframe.
+                    self.bad_headers += 1
+                    continue
+
+                patch_rgb = rgb332_to_rgb(patch)
+                row_bytes = rect_w * 3
+                for row in range(rect_h):
+                    dst = ((rect_y + row) * frame_w + rect_x) * 3
+                    src = row * row_bytes
+                    self._frame_rgb[dst : dst + row_bytes] = patch_rgb[src : src + row_bytes]
+                self.frames += 1
+                self.seq = seq
+                self._pending_delta = True
+                continue
+
+            # Full ZWF2 keyframe.
+            idx = packet_idx
             if len(self.buf) < idx + HEADER.size:
                 self._flush_prefix(idx)
                 return
@@ -332,15 +427,16 @@ class FrameParser:
                 self.bad_headers += 1
                 self._flush_prefix(idx + 1)
                 continue
-            if len(self.buf) < idx + HEADER.size + plen:
+            packet_end = idx + HEADER.size + plen
+            if len(self.buf) < packet_end:
                 self._flush_prefix(idx)
                 return
-            payload = bytes(self.buf[idx + HEADER.size : idx + HEADER.size + plen])
+            payload = bytes(self.buf[idx + HEADER.size : packet_end])
             if zlib.crc32(payload) & 0xFFFFFFFF != crc:
                 self.crc_errors += 1
-                self._flush_prefix(idx + 1)  # resync: skip this magic only
+                self._flush_prefix(idx + 1)
                 continue
-            del self.buf[: idx + HEADER.size + plen]
+            del self.buf[:packet_end]
             self.payload_bytes += plen
             if flags & FLAG_RLE:
                 try:
@@ -355,17 +451,23 @@ class FrameParser:
                 if len(payload) != expected_len:
                     self.bad_headers += 1
                     continue
-            self.frames += 1
-            self.seq = seq
             if flags & FLAG_CHROMA_CARRIER:
                 rgb_frame = chroma_carrier_decode(payload, w, h)
             elif is_8bit:
                 rgb_frame = rgb332_to_rgb(payload)
             else:
                 rgb_frame = rgb565_to_rgb(payload)
-            self._pending = (w, h, rgb_frame)
+            self._frame_size = (w, h)
+            self._frame_rgb = bytearray(rgb_frame)
+            self.frames += 1
+            self.seq = seq
+            self._pending = (w, h, bytes(self._frame_rgb))
+            self._pending_delta = False
 
     def pull(self):
+        if self._pending_delta and self._frame_size is not None and self._frame_rgb is not None:
+            self._pending = (*self._frame_size, bytes(self._frame_rgb))
+            self._pending_delta = False
         frame, self._pending = self._pending, None
         return frame
 
