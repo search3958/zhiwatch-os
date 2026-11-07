@@ -1,8 +1,9 @@
 use super::*;
+use alloc::boxed::Box;
 #[derive(Clone)]
 pub(crate) struct Attr {
-    pub(crate) key: String,
-    pub(crate) value: String,
+    pub(crate) key: Box<str>,
+    pub(crate) value: Box<str>,
 }
 
 #[derive(Clone, Default)]
@@ -11,7 +12,6 @@ pub(crate) struct Node {
     pub(crate) attrs: Vec<Attr>,
     pub(crate) children: Vec<usize>,
     pub(crate) parent: Option<usize>,
-    pub(crate) text: String,
     pub(crate) x: i32,
     pub(crate) y: i32,
     pub(crate) w: i32,
@@ -29,8 +29,8 @@ impl Node {
     pub(crate) fn attr(&self, key: &str) -> &str {
         self.attrs
             .iter()
-            .find(|a| a.key == key)
-            .map(|a| a.value.as_str())
+            .find(|a| a.key.as_ref() == key)
+            .map(|a| a.value.as_ref())
             .unwrap_or("")
     }
     pub(crate) fn id(&self) -> &str {

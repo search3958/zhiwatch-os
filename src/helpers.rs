@@ -418,6 +418,51 @@ pub(crate) fn blur_shadow_alpha(alpha: &mut [u8], width: usize, height: usize, r
     }
 }
 
+/// Draw the built-in 8x8 font at signed coordinates.
+///
+/// `LayerSystem::put_str` takes `usize` because it predates viewport slicing;
+/// the embedded band renderer frequently paints glyph rows above the band, so
+/// clip rows and columns explicitly instead of dropping the whole string.
+fn put_str_8x8_signed(
+    layer: &mut LayerSystem,
+    mut x: i32,
+    y: i32,
+    text: &str,
+    color: Color,
+) {
+    let layer_w = layer.width();
+    let layer_h = layer.height();
+    let (clip_x0, clip_y0, clip_x1, clip_y1) = layer.clip_bounds();
+    let x0 = clip_x0.min(layer_w) as i32;
+    let y0 = clip_y0.min(layer_h) as i32;
+    let x1 = clip_x1.min(layer_w) as i32;
+    let y1 = clip_y1.min(layer_h) as i32;
+    let buf = layer.buf_mut();
+    for byte in text.bytes() {
+        if byte >= 0x80 {
+            break;
+        }
+        let glyph = baram_font::font::glyph(byte);
+        for row in 0..baram_font::font::GLYPH_H {
+            let py = y + row as i32;
+            if py < y0 || py >= y1 {
+                continue;
+            }
+            let bits = glyph[row];
+            for col in 0..baram_font::font::GLYPH_W {
+                if (bits >> (7 - col)) & 1 == 0 {
+                    continue;
+                }
+                let px = x + col as i32;
+                if px >= x0 && px < x1 {
+                    buf[py as usize * layer_w + px as usize] = color.0;
+                }
+            }
+        }
+        x += baram_font::font::GLYPH_W as i32;
+    }
+}
+
 pub(crate) fn put_str_size(
     layer: &mut LayerSystem,
     x: i32,
@@ -462,9 +507,7 @@ pub(crate) fn put_str_size(
     {
         let mut x = x;
         if !ttf_font::is_available() {
-            if x >= 0 && y >= 0 {
-                layer.put_str(x as usize, y as usize, text, color);
-            }
+            put_str_8x8_signed(layer, x, y, text, color);
             return;
         }
         let baseline = y + ttf_font::ascent_at_size(size);
@@ -501,10 +544,8 @@ pub(crate) fn put_str_size(
     }
     #[cfg(not(feature = "ttf"))]
     {
-        if x >= 0 && y >= 0 {
-            layer.put_str(x as usize, y as usize, text, color);
-        }
-        let _ = (x, y, size);
+        put_str_8x8_signed(layer, x, y, text, color);
+        let _ = size;
     }
 }
 

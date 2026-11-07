@@ -168,7 +168,10 @@ impl LayerSystem {
             return;
         }
 
-        const SAMPLES: usize = 8;
+        // Four samples per axis give 16 coverage levels (4-bit alpha). That is
+        // enough to smooth the control edges on a 135x240 panel and avoids the
+        // precision cost of a 64-sample mask.
+        const SAMPLES: usize = 4;
         const SAMPLE_COUNT: f32 = (SAMPLES * SAMPLES) as f32;
         let radius = r as f32;
         let right_inner = w as f32 - radius;

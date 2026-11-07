@@ -75,6 +75,7 @@ impl Warp4Engine {
                     root,
                     ox,
                     flow_oy,
+                    0,
                     false,
                     chrome_mode,
                     PaintPass::Flow,
@@ -88,7 +89,7 @@ impl Warp4Engine {
             );
             for &root in &self.roots {
                 if self.fixed_subtree.get(root).copied().unwrap_or(true) {
-                    self.paint(layer, root, ox, oy, false, chrome_mode, PaintPass::Fixed);
+                    self.paint(layer, root, ox, oy, 0, false, chrome_mode, PaintPass::Fixed);
                 }
             }
         } else {
@@ -101,12 +102,13 @@ impl Warp4Engine {
                     root,
                     ox,
                     flow_oy,
+                    0,
                     false,
                     chrome_mode,
                     PaintPass::Flow,
                 );
                 if self.fixed_subtree.get(root).copied().unwrap_or(true) {
-                    self.paint(layer, root, ox, oy, false, chrome_mode, PaintPass::Fixed);
+                    self.paint(layer, root, ox, oy, 0, false, chrome_mode, PaintPass::Fixed);
                 }
             }
         }
@@ -119,6 +121,44 @@ impl Warp4Engine {
             self.paint_spinner_popup(layer, fade.idx, opacity);
         }
         self.paint_transition(layer);
+    }
+
+    /// Paint one horizontal slice of the viewport into a small band layer.
+    ///
+    /// The layer is only `BAND_HEIGHT` rows tall, so the embedded runtime never
+    /// needs a full-screen pixel buffer. `band_y` is the destination row in
+    /// the logical frame; painting is translated by `-band_y` and clipped by
+    /// the layer's normal signed clipping. Layout must already be current
+    /// (call `update()` first).
+    pub fn draw_band_to_layer(&mut self, layer: &mut LayerSystem, band_y: i32) {
+        layer.fill_rect(0, 0, layer.width(), layer.height(), bg());
+        let chrome_mode = self.has_explicit_scroll();
+        let flow_oy = -self.scroll - band_y;
+        let fixed_oy = -band_y;
+        for &root in &self.roots {
+            self.paint(
+                layer,
+                root,
+                0,
+                flow_oy,
+                fixed_oy,
+                false,
+                chrome_mode,
+                PaintPass::Flow,
+            );
+            if self.fixed_subtree.get(root).copied().unwrap_or(true) {
+                self.paint(
+                    layer,
+                    root,
+                    0,
+                    fixed_oy,
+                    fixed_oy,
+                    false,
+                    chrome_mode,
+                    PaintPass::Fixed,
+                );
+            }
+        }
     }
 
     pub(crate) fn paint_transition(&self, layer: &mut LayerSystem) {
@@ -163,7 +203,8 @@ impl Warp4Engine {
         layer: &mut LayerSystem,
         idx: usize,
         ox: i32,
-        oy: i32,
+        flow_oy: i32,
+        fixed_oy: i32,
         in_scroll: bool,
         chrome_mode: bool,
         pass: PaintPass,
@@ -183,7 +224,7 @@ impl Warp4Engine {
                 // descendants. The fixed pass runs after the flow pass, so
                 // doing this later would cover a white ScrollView's content.
                 let x = n.x + ox;
-                let y = n.y;
+                let y = n.y + fixed_oy;
                 if let Some(fill) = parse_color(n.attr("background")) {
                     let radius = parse_dim(n.attr("cornerRadius"), 0).max(0) as usize;
                     if radius > 0 {
@@ -209,7 +250,7 @@ impl Warp4Engine {
                     }
                 }
                 let clip_x0 = n.x + ox;
-                let clip_y0 = n.y;
+                let clip_y0 = n.y + fixed_oy;
                 layer.push_clip(
                     clip_x0.max(0) as usize,
                     clip_y0.max(self.chrome_height).max(0) as usize,
@@ -219,12 +260,21 @@ impl Warp4Engine {
             }
             let child_scroll = in_scroll || is_scroll_container(n);
             let child_oy = if is_sticky(n) {
-                self.node_screen_y(idx).saturating_sub(n.y)
+                self.node_screen_y(idx).saturating_sub(n.y) + fixed_oy
             } else {
-                oy
+                flow_oy
             };
             for &child in &n.children {
-                self.paint(layer, child, ox, child_oy, child_scroll, chrome_mode, pass);
+                self.paint(
+                    layer,
+                    child,
+                    ox,
+                    child_oy,
+                    fixed_oy,
+                    child_scroll,
+                    chrome_mode,
+                    pass,
+                );
             }
             if clipped_scroll {
                 layer.pop_clip();
@@ -234,20 +284,31 @@ impl Warp4Engine {
         if pass == PaintPass::Fixed && !fixed {
             let child_scroll = in_scroll || is_scroll_container(n);
             let child_oy = if is_sticky(n) {
-                self.node_screen_y(idx).saturating_sub(n.y)
+                self.node_screen_y(idx).saturating_sub(n.y) + fixed_oy
             } else {
-                oy
+                fixed_oy
             };
             for &child in &n.children {
-                self.paint(layer, child, ox, child_oy, child_scroll, chrome_mode, pass);
+                self.paint(
+                    layer,
+                    child,
+                    ox,
+                    child_oy,
+                    fixed_oy,
+                    child_scroll,
+                    chrome_mode,
+                    pass,
+                );
             }
             return;
         }
         let x = n.x + ox;
         let y = if is_sticky(n) {
-            self.node_screen_y(idx)
+            self.node_screen_y(idx) + fixed_oy
+        } else if fixed {
+            n.y + fixed_oy
         } else {
-            n.y + if fixed { 0 } else { oy }
+            n.y + flow_oy
         };
         let w = n.w.max(1) as usize;
         let h = n.h.max(1) as usize;
@@ -735,12 +796,23 @@ impl Warp4Engine {
             );
         }
         let child_oy = if is_sticky(n) {
-            self.node_screen_y(idx).saturating_sub(n.y)
+            self.node_screen_y(idx).saturating_sub(n.y) + fixed_oy
+        } else if pass == PaintPass::Fixed {
+            fixed_oy
         } else {
-            oy
+            flow_oy
         };
         for &child in &n.children {
-            self.paint(layer, child, ox, child_oy, child_scroll, chrome_mode, pass);
+            self.paint(
+                layer,
+                child,
+                ox,
+                child_oy,
+                fixed_oy,
+                child_scroll,
+                chrome_mode,
+                pass,
+            );
         }
         if is_scroll_container(n) {
             if n.is("ScrollView") && n.content_h > n.h {

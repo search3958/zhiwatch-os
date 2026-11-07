@@ -1,37 +1,38 @@
 use super::*;
 
-pub(crate) struct XmlParser {
-    chars: Vec<char>,
+pub(crate) struct XmlParser<'a> {
+    src: &'a str,
     pos: usize,
 }
-impl XmlParser {
-    pub(crate) fn new(s: &str) -> Self {
-        Self {
-            chars: s.chars().collect(),
-            pos: 0,
-        }
+impl<'a> XmlParser<'a> {
+    pub(crate) fn new(s: &'a str) -> Self {
+        Self { src: s, pos: 0 }
+    }
+    fn bytes(&self) -> &'a [u8] {
+        self.src.as_bytes()
     }
     pub(crate) fn parse_element(
         &mut self,
         parent: Option<usize>,
         nodes: &mut Vec<Node>,
     ) -> Option<usize> {
-        while self.pos < self.chars.len() && self.chars[self.pos] != '<' {
+        let bytes = self.bytes();
+        while self.pos < bytes.len() && bytes[self.pos] != b'<' {
             self.pos += 1;
         }
-        if self.pos >= self.chars.len() {
+        if self.pos >= bytes.len() {
             return None;
         }
         self.pos += 1;
-        if self.chars.get(self.pos) == Some(&'?') {
-            while self.pos < self.chars.len() && self.chars[self.pos] != '>' {
+        if bytes.get(self.pos) == Some(&b'?') {
+            while self.pos < bytes.len() && bytes[self.pos] != b'>' {
                 self.pos += 1;
             }
             self.pos += 1;
             return self.parse_element(parent, nodes);
         }
-        if self.chars.get(self.pos) == Some(&'!') {
-            while self.pos < self.chars.len() && self.chars[self.pos] != '>' {
+        if bytes.get(self.pos) == Some(&b'!') {
+            while self.pos < bytes.len() && bytes[self.pos] != b'>' {
                 self.pos += 1;
             }
             self.pos += 1;
@@ -42,7 +43,7 @@ impl XmlParser {
             return None;
         }
         let attrs = self.attrs();
-        let self_close = self.chars.get(self.pos.saturating_sub(2)) == Some(&'/');
+        let self_close = self.pos >= 2 && self.bytes()[self.pos - 2] == b'/';
         if nodes.len() >= MAX_NODES {
             return None;
         }
@@ -58,29 +59,28 @@ impl XmlParser {
         }
         loop {
             self.skip();
-            if self.pos >= self.chars.len() {
+            let bytes = self.bytes();
+            if self.pos >= bytes.len() {
                 break;
             }
-            if self.chars[self.pos] == '<' && self.chars.get(self.pos + 1) == Some(&'/') {
-                while self.pos < self.chars.len() && self.chars[self.pos] != '>' {
+            if bytes[self.pos] == b'<' && bytes.get(self.pos + 1) == Some(&b'/') {
+                while self.pos < bytes.len() && self.bytes()[self.pos] != b'>' {
                     self.pos += 1;
                 }
                 self.pos += 1;
                 break;
             }
-            if self.chars[self.pos] == '<' {
+            if bytes[self.pos] == b'<' {
                 if let Some(c) = self.parse_element(Some(idx), nodes) {
                     nodes[idx].children.push(c);
                 }
             } else {
                 let start = self.pos;
-                while self.pos < self.chars.len() && self.chars[self.pos] != '<' {
+                while self.pos < self.bytes().len() && self.bytes()[self.pos] != b'<' {
                     self.pos += 1;
                 }
-                let s: String = self.chars[start..self.pos].iter().collect();
-                let s = s.trim();
+                let s = self.src[start..self.pos].trim();
                 if !s.is_empty() {
-                    nodes[idx].text.push_str(s);
                     set_attr(&mut nodes[idx], "text", s);
                 }
             }
@@ -88,57 +88,60 @@ impl XmlParser {
         Some(idx)
     }
     fn ident(&mut self) -> String {
+        let bytes = self.bytes();
         let s = self.pos;
-        while self.pos < self.chars.len()
-            && (self.chars[self.pos].is_ascii_alphanumeric()
-                || matches!(self.chars[self.pos], ':' | '_' | '-'))
+        while self.pos < bytes.len()
+            && (bytes[self.pos].is_ascii_alphanumeric()
+                || matches!(bytes[self.pos], b':' | b'_' | b'-'))
         {
             self.pos += 1;
         }
-        self.chars[s..self.pos].iter().collect()
+        self.src[s..self.pos].into()
     }
     fn attrs(&mut self) -> Vec<Attr> {
         let mut out = Vec::new();
         loop {
             self.skip();
-            if self.pos >= self.chars.len() || self.chars[self.pos] == '>' {
+            let bytes = self.bytes();
+            if self.pos >= bytes.len() || bytes[self.pos] == b'>' {
                 self.pos += 1;
                 break;
             }
-            if self.chars[self.pos] == '/' {
+            if bytes[self.pos] == b'/' {
                 self.pos += 1;
                 self.skip();
-                if self.chars.get(self.pos) == Some(&'>') {
+                if self.bytes().get(self.pos) == Some(&b'>') {
                     self.pos += 1;
                 }
                 break;
             }
             let raw = self.ident();
             self.skip();
-            if self.chars.get(self.pos) != Some(&'=') {
+            if self.bytes().get(self.pos) != Some(&b'=') {
                 continue;
             }
             self.pos += 1;
             self.skip();
-            let q = self.chars.get(self.pos).copied().unwrap_or('"');
-            if q == '"' || q == '\'' {
+            let q = *self.bytes().get(self.pos).unwrap_or(&b'"');
+            if q == b'"' || q == b'\'' {
                 self.pos += 1;
                 let s = self.pos;
-                while self.pos < self.chars.len() && self.chars[self.pos] != q {
+                while self.pos < self.bytes().len() && self.bytes()[self.pos] != q {
                     self.pos += 1;
                 }
-                let value: String = self.chars[s..self.pos].iter().collect();
+                let value = &self.src[s..self.pos];
                 self.pos += 1;
                 out.push(Attr {
                     key: raw.rsplit(':').next().unwrap_or(&raw).into(),
-                    value: decode(&value),
+                    value: decode(value).into(),
                 });
             }
         }
         out
     }
     fn skip(&mut self) {
-        while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
+        let bytes = self.bytes();
+        while self.pos < bytes.len() && bytes[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
     }
@@ -472,7 +475,7 @@ fn condition(s: &str) -> Option<(String, String, String)> {
     None
 }
 pub(crate) fn set_attr(n: &mut Node, key: &str, value: &str) {
-    if let Some(a) = n.attrs.iter_mut().find(|a| a.key == key) {
+    if let Some(a) = n.attrs.iter_mut().find(|a| a.key.as_ref() == key) {
         a.value = value.into();
     } else {
         n.attrs.push(Attr {

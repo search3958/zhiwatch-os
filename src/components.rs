@@ -20,12 +20,10 @@ pub(crate) fn fill_ui_rounded_rect_at(
     radius: usize,
     color: Color,
 ) {
-    if is_xiao() {
+    if is_xiao() || x < 0 || y < 0 {
         layer.fill_rounded_rect_aa(x, y, w, h, radius, color);
-    } else if x >= 0 && y >= 0 {
-        layer.fill_rounded_rect(x as usize, y as usize, w, h, radius, color);
     } else {
-        layer.fill_rect_signed(x, y, w, h, color);
+        layer.fill_rounded_rect(x as usize, y as usize, w, h, radius, color);
     }
 }
 

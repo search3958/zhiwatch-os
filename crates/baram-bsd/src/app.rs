@@ -24,7 +24,10 @@ pub fn load_app_source(name: &str) -> alloc::string::String {
 pub struct Warp3Archive {
     app_name: alloc::string::String,
     data: alloc::vec::Vec<u8>,
-    embedded: Option<alloc::vec::Vec<(alloc::string::String, alloc::string::String)>>,
+    /// Embedded sources stay in flash. Borrowing them instead of cloning into
+    /// heap strings is what lets the ESP32-C3 runtime load `main.w4u` /
+    /// `main.w4s` without keeping a second copy in RAM.
+    embedded: Option<alloc::vec::Vec<(&'static str, &'static str)>>,
 }
 
 /// The archive transport is shared by the native Warp runtimes.  The alias
@@ -56,21 +59,11 @@ impl Warp3Archive {
 
     /// Builds an OS-owned Warp 3 resource set without registering an app or
     /// placing files in the application VFS.
-    pub fn from_embedded(name: &str, sources: &[(&str, &str)]) -> Self {
+    pub fn from_embedded(name: &str, sources: &[(&'static str, &'static str)]) -> Self {
         Self {
             app_name: alloc::string::String::from(name),
             data: alloc::vec::Vec::new(),
-            embedded: Some(
-                sources
-                    .iter()
-                    .map(|(name, source)| {
-                        (
-                            alloc::string::String::from(*name),
-                            alloc::string::String::from(*source),
-                        )
-                    })
-                    .collect(),
-            ),
+            embedded: Some(sources.to_vec()),
         }
     }
 
@@ -78,22 +71,32 @@ impl Warp3Archive {
         &self.app_name
     }
 
-    pub fn read_text(&self, member_name: &str) -> alloc::string::String {
+    /// Read a member without copying embedded sources into the heap.
+    ///
+    /// Embedded sources are `&'static str` pointing straight at flash, so the
+    /// returned `Cow` is borrowed. File-backed archives still return an owned
+    /// string because their TAR buffer lives in the archive itself.
+    pub fn read_text_cow(&self, member_name: &str) -> alloc::borrow::Cow<'static, str> {
+        use alloc::borrow::Cow;
         if !is_safe_archive_member(member_name) {
-            return alloc::string::String::new();
+            return Cow::Borrowed("");
         }
         let wanted = member_name.trim_start_matches("./");
         if let Some(sources) = &self.embedded {
             return sources
                 .iter()
                 .find(|(name, _)| name.trim_start_matches("./") == wanted)
-                .map(|(_, source)| source.clone())
-                .unwrap_or_default();
+                .map(|(_, source)| Cow::Borrowed(*source))
+                .unwrap_or(Cow::Borrowed(""));
         }
-        let Some(bytes) = self.read(member_name) else {
-            return alloc::string::String::new();
-        };
-        alloc::string::String::from_utf8(bytes.to_vec()).unwrap_or_default()
+        match self.read(member_name) {
+            Some(bytes) => Cow::Owned(alloc::string::String::from_utf8(bytes.to_vec()).unwrap_or_default()),
+            None => Cow::Borrowed(""),
+        }
+    }
+
+    pub fn read_text(&self, member_name: &str) -> alloc::string::String {
+        self.read_text_cow(member_name).into_owned()
     }
 
     fn read(&self, member_name: &str) -> Option<&[u8]> {

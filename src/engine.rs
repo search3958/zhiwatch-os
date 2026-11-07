@@ -29,7 +29,7 @@ impl Warp4Engine {
         Self::from_archive(Warp4Archive::open(app_name))
     }
 
-    pub fn new_embedded(name: &str, sources: &[(&str, &str)]) -> Self {
+    pub fn new_embedded(name: &str, sources: &[(&'static str, &'static str)]) -> Self {
         Self::from_archive(Warp4Archive::from_embedded(name, sources))
     }
 
@@ -517,31 +517,35 @@ impl Warp4Engine {
         self.scroll_started_ns = None;
         self.wait_until_ns = None;
         self.pending.clear();
-        let mut layout = self.archive.read_text(&format!("{}.w4u", self.screen));
+        let mut layout = self.archive.read_text_cow(&format!("{}.w4u", self.screen));
         if layout.is_empty() {
-            layout = self.archive.read_text(&format!("{}.w3u", self.screen));
+            layout = self.archive.read_text_cow(&format!("{}.w3u", self.screen));
         }
         // A few early Warp 4 examples were distributed as plain XML instead
         // of using the `.w4u` member name. They are the same native view-tree
         // format; accepting the suffix here keeps those archives native while
         // avoiding an HTML conversion path.
         if layout.is_empty() {
-            layout = self.archive.read_text(&format!("{}.xml", self.screen));
+            layout = self.archive.read_text_cow(&format!("{}.xml", self.screen));
         }
         if layout.is_empty() && self.screen != "main" {
-            layout = self.archive.read_text("main.xml");
+            layout = self.archive.read_text_cow("main.xml");
         }
         let mut parser = XmlParser::new(&layout);
         if let Some(root) = parser.parse_element(None, &mut self.nodes) {
             self.roots.push(root);
         }
-        let mut source = self.archive.read_text(&format!("{}.w4s", self.screen));
+        let mut source = self.archive.read_text_cow(&format!("{}.w4s", self.screen));
         if source.is_empty() {
-            source = self.archive.read_text(&format!("{}.w3s", self.screen));
+            source = self.archive.read_text_cow(&format!("{}.w3s", self.screen));
         }
         self.script = parse_script(&source);
-        let init = self.script.init.clone();
+        // Init actions are only needed once. Taking them out of the script
+        // lets their argument strings be freed instead of kept for the whole
+        // session.
+        let init = core::mem::take(&mut self.script.init);
         self.execute(&init);
+        drop(init);
         // Init provides defaults on the first load. When this is a reload,
         // restore the values owned by the already-running application.
         for (key, value) in previous_state {
@@ -558,6 +562,21 @@ impl Warp4Engine {
         self.dirty = true;
         self.layout_dirty = true;
         self.preload_text_cache();
+        // The parser grows its vectors geometrically. Trim the unused tail so
+        // the steady-state heap matches the actual document size.
+        self.nodes.shrink_to_fit();
+        self.roots.shrink_to_fit();
+        self.fixed_subtree.shrink_to_fit();
+        self.pending.shrink_to_fit();
+        self.state.shrink_to_fit();
+        self.script.clicks.shrink_to_fit();
+        self.script.functions.shrink_to_fit();
+        for (_, actions) in &mut self.script.clicks {
+            actions.shrink_to_fit();
+        }
+        for (_, actions) in &mut self.script.functions {
+            actions.shrink_to_fit();
+        }
     }
 
     pub(crate) fn rebuild_fixed_subtree(&mut self, chrome_mode: bool) {

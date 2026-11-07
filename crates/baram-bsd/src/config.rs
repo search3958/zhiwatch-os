@@ -501,6 +501,18 @@ pub fn init_config() {
     bump_revision();
 }
 
+/// Initialize an empty configuration without parsing the XML document.
+///
+/// Every lookup falls back to the caller's default, which is enough for the
+/// embedded Xiao runtime where the full theme document would otherwise cost
+/// several kilobytes of heap for values the renderer already hard-codes.
+pub fn init_config_minimal() {
+    unsafe {
+        GLOBAL_CONFIG = Some(Config::new());
+    }
+    bump_revision();
+}
+
 pub fn reset_to_default() {
     let default_config = Config::load_from_bytes(DEFAULT_CONFIG_XML);
     unsafe {
