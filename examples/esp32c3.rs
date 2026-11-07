@@ -4,6 +4,8 @@
 extern crate alloc;
 
 use core::panic::PanicInfo;
+use baram_core::frame::encode_frame_rle;
+use baram_core::text_plane::{rgb332_from_color, TextPlane};
 use baram_core::{Color, LayerSystem};
 use baram_warp4::{set_ui_mode, set_ui_scale_percent, set_xiao_size, UiMode, Warp4Engine};
 use esp_hal::{
@@ -32,26 +34,25 @@ const JOYSTICK_CAL_SAMPLES: usize = 16;
 const JOYSTICK_CAL_DELAY_MS: u32 = 8;
 const JOYSTICK_RECENTER_BAND: i32 = 80;
 const JOYSTICK_RECENTER_SHIFT: i32 = 4;
-// The cursor is a 5x5 plus sign. Its pixels are the only part of the layer
-// that changes while the UI is idle, so keep a tiny backing store for them
-// instead of repainting the whole view tree for every pointer step.
-const CURSOR_RADIUS: i32 = 2;
-const CURSOR_BOX: usize = (CURSOR_RADIUS * 2 + 1) as usize;
 const LOOP_DELAY_MS: u32 = 20;
 const FRAME_TIME_NS: u64 = LOOP_DELAY_MS as u64 * 1_000_000;
 // USB full-speed CDC sustains well under 1.5 MB/s; with RLE payloads around
 // 6 KiB this cap allows roughly 10-15 frames per second.
 const MIN_FRAME_INTERVAL_MS: u64 = 66;
 
-// Frame stream protocol (little-endian header, 8-bit payload):
+// Frame stream protocol (little-endian header, 8-bit samples):
 // magic "ZWF2" | width u16 | height u16 | flags u16 | seq u32 | payload_len u32 | crc32 u32
+// flags bit0: payload is RLE (the only compression used; lossless)
 // flags bit1: payload is chroma carrier modulated (Y luminance base + C subcarrier)
 // flags bit2: payload is 8-bit color (RGB332)
-// The firmware always sends raw samples; the viewer still accepts legacy RLE.
+// The CRC covers the payload bytes as transmitted (the RLE stream).
 const FRAME_MAGIC: [u8; 4] = *b"ZWF2";
 const FRAME_HEADER_LEN: usize = 22;
+const FRAME_FLAG_RLE: u16 = 1;
 const FRAME_FLAG_CHROMA_CARRIER: u16 = 2;
 const FRAME_FLAG_8BIT: u16 = 4;
+// The UI font: the HMOS subset is copied to RAM at boot (see main).
+const FONT_BYTES: &[u8] = include_bytes!("../files/data/ui/HMOS_SANS_SUBSET.ttf");
 // Give up on a frame if the host stops draining the USB FIFO for this long,
 // so the input loop keeps running when no viewer is attached.
 const USB_STALL_TIMEOUT_MS: u64 = 30;
@@ -126,6 +127,11 @@ fn main() -> ! {
     // usage after the band conversion is a small fraction of this region.
     esp_alloc::heap_allocator!(size: 256 * 1024);
     esp_println::println!("[ok] Heap allocator initialized (256 KiB)");
+
+    // The UI face is copied into RAM (heap); the parser and rasterizer never
+    // read flash after this point.
+    baram_font::ttf_font::init_with_data(FONT_BYTES);
+    esp_println::println!("[ok] Font HMOS_SANS_SUBSET loaded to RAM ({} bytes)", FONT_BYTES.len());
 
     // Measure the flashed app image once at boot. The viewer displays this as
     // flash usage; failures fall back to "unknown" instead of blocking boot.
@@ -202,7 +208,14 @@ fn main() -> ! {
     engine.set_chrome_visible(false);
     engine.update(LOGICAL_WIDTH as i32, LOGICAL_HEIGHT as i32);
 
+    // Shape plane: every pixel except text, 8-bit RGB332, cached until the UI
+    // changes. Text lives in the band layer's text plane (3-bit coverage).
     let mut band = LayerSystem::new(LOGICAL_WIDTH, BAND_HEIGHT);
+    band.enable_text_plane(LOGICAL_WIDTH, LOGICAL_HEIGHT);
+    let mut shape = alloc::vec![0u8; LOGICAL_WIDTH * LOGICAL_HEIGHT];
+    let cache_bytes = shape.len()
+        + band.text_plane().map(TextPlane::ram_bytes).unwrap_or(0);
+    esp_println::println!("[ok] Frame cache: shape {} B + text plane {} B", shape.len(), cache_bytes - shape.len());
     let mut cursor_x = (LOGICAL_WIDTH / 2) as i32;
     let mut cursor_y = (LOGICAL_HEIGHT / 2) as i32;
     let mut chroma_carrier_mode = false;
@@ -211,26 +224,9 @@ fn main() -> ! {
     let mut seq = 0_u32;
     let mut last_frame_sent: Option<Instant> = None;
     let mut pending_send = true;
+    let mut cache_valid = false;
     let mut cursor_dirty = false;
     let mut stream_active = false;
-    if let Some(sent) = try_send(
-        &mut usb,
-        &mut engine,
-        &mut band,
-        cursor_x,
-        cursor_y,
-        &mut seq,
-        &mut last_frame_sent,
-        chroma_carrier_mode,
-    ) {
-        pending_send = !sent;
-        stream_active = sent;
-        if sent {
-            esp_println::println!("[ok] First frame streamed to USB (8-bit color)");
-        } else {
-            esp_println::println!("[wait] No USB host draining yet; frames resume when the viewer opens");
-        }
-    }
 
     let mut now_ns = 0_u64;
     let boot_instant = Instant::now();
@@ -395,23 +391,25 @@ fn main() -> ! {
         }
         previous_button_down = button_down;
 
-        // Do not repaint faster than the USB link can carry frames. The band
-        // streamer always repaints the whole viewport, so cursor motion and
-        // view-state changes use the same path.
-        let frame_due = match last_frame_sent {
-            Some(sent_at) => sent_at.elapsed().as_millis() >= MIN_FRAME_INTERVAL_MS,
-            None => true,
-        };
-        if frame_due && (engine.is_dirty() || cursor_dirty) {
+        // The shape and text planes are rebuilt only when the UI changed. A
+        // cursor step never touches them: it is composed into the frame at
+        // transmit time. Rebuilds are not throttled, so the cache stays current.
+        if engine.is_dirty() || !cache_valid {
+            rebuild_cache(&mut engine, &mut band, &mut shape);
+            cache_valid = true;
+            pending_send = true;
+        }
+        if cursor_dirty {
             cursor_dirty = false;
             pending_send = true;
         }
 
+        // Transmit at most once per MIN_FRAME_INTERVAL_MS.
         if pending_send {
             match try_send(
                 &mut usb,
-                &mut engine,
-                &mut band,
+                &shape,
+                band.text_plane(),
                 cursor_x,
                 cursor_y,
                 &mut seq,
@@ -429,7 +427,7 @@ fn main() -> ! {
                         stream_active = sent;
                     }
                 }
-                // Throttled: render and send when the next frame is due.
+                // Throttled: send when the next frame is due.
                 None => {}
             }
         }
@@ -467,8 +465,8 @@ fn main() -> ! {
 /// elapsed, `Some(sent)` once an attempt was actually made.
 fn try_send(
     usb: &mut UsbSerialJtag<'_, Blocking>,
-    engine: &mut Warp4Engine,
-    band: &mut LayerSystem,
+    shape: &[u8],
+    text: Option<&TextPlane>,
     cursor_x: i32,
     cursor_y: i32,
     seq: &mut u32,
@@ -481,15 +479,7 @@ fn try_send(
         }
     }
     *seq = seq.wrapping_add(1);
-    let ok = send_frame(
-        usb,
-        engine,
-        band,
-        cursor_x,
-        cursor_y,
-        *seq,
-        chroma_carrier,
-    );
+    let ok = send_frame(usb, shape, text, cursor_x, cursor_y, *seq, chroma_carrier);
     *last_frame_sent = Some(Instant::now());
     Some(ok)
 }
@@ -755,117 +745,70 @@ fn flush_nb(usb: &mut UsbSerialJtag<'_, Blocking>, last_progress: &mut Instant) 
 }
 
 
-#[inline(always)]
-fn rgb_to_rgb332(r: u8, g: u8, b: u8) -> u8 {
-    (r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6)
-}
-
-#[inline(always)]
-fn rgb_to_chroma_carrier(r: u8, g: u8, b: u8, x: usize, y: usize) -> u8 {
-    let r_i = r as i32;
-    let g_i = g as i32;
-    let b_i = b as i32;
-    // Y: 0.299 R + 0.587 G + 0.114 B -> (77*R + 150*G + 29*B) >> 8
-    let y_val = (77 * r_i + 150 * g_i + 29 * b_i) >> 8;
-    // U: 0.492 (B - Y) -> ((b_i - y_val) * 126) >> 8
-    // V: 0.877 (R - Y) -> ((r_i - y_val) * 224) >> 8
-    let u_val = ((b_i - y_val) * 126) >> 8;
-    let v_val = ((r_i - y_val) * 224) >> 8;
-
-    let y_phase = (y & 1) * 2;
-    let phase = (x + y_phase) & 3;
-    let carrier = match phase {
-        0 => u_val,
-        1 => v_val,
-        2 => -u_val,
-        _ => -v_val,
-    };
-    (y_val + carrier).clamp(0, 255) as u8
-}
-
-#[inline(always)]
-fn color_to_sample(pixel: u32, x: usize, y: usize, chroma_carrier: bool) -> u8 {
-    let col = Color(pixel);
-    if chroma_carrier {
-        rgb_to_chroma_carrier(col.r(), col.g(), col.b(), x, y)
-    } else {
-        rgb_to_rgb332(col.r(), col.g(), col.b())
+/// Rebuild the shape plane from the UI. Each band is painted into the 32-bit
+/// band scratch (8 rows), then converted to RGB332 in the shape plane. Text
+/// goes into the band's text plane at the same time. This runs only when the
+/// UI is dirty, not on cursor motion.
+fn rebuild_cache(engine: &mut Warp4Engine, band: &mut LayerSystem, shape: &mut [u8]) {
+    if engine.is_dirty() {
+        engine.update(LOGICAL_WIDTH as i32, LOGICAL_HEIGHT as i32);
+    }
+    let mut band_y = 0usize;
+    while band_y < LOGICAL_HEIGHT {
+        let rows = BAND_HEIGHT.min(LOGICAL_HEIGHT - band_y);
+        band.set_text_origin(band_y);
+        engine.draw_band_to_layer(band, band_y as i32);
+        let pixels = band.buf_ref();
+        for row in 0..rows {
+            let dst = &mut shape[(band_y + row) * LOGICAL_WIDTH..(band_y + row + 1) * LOGICAL_WIDTH];
+            for (x, out) in dst.iter_mut().enumerate() {
+                *out = rgb332_from_color(Color(pixels[row * LOGICAL_WIDTH + x]));
+            }
+        }
+        band_y += rows;
     }
 }
 
-/// Paint one slice of the current view frame into the reusable band layer.
-fn draw_band(
-    engine: &mut Warp4Engine,
-    band: &mut LayerSystem,
-    band_y: usize,
-    cursor_x: i32,
-    cursor_y: i32,
-) {
-    engine.draw_band_to_layer(band, band_y as i32);
-    draw_cursor_layer(band, cursor_x, cursor_y - band_y as i32);
-}
-
-/// Draw the 5x5 cursor directly into a band. Coordinates are band-local; the
-/// layer's signed fill clips anything above or below the slice.
-fn draw_cursor_layer(layer: &mut LayerSystem, x: i32, y: i32) {
-    let radius = CURSOR_RADIUS;
-    let black = Color::rgb(0, 0, 0);
-    let white = Color::rgb(255, 255, 255);
-    layer.fill_rect_signed(x - radius, y, CURSOR_BOX, 1, black);
-    layer.fill_rect_signed(x, y - radius, 1, CURSOR_BOX, black);
-    layer.fill_rect_signed(x - 1, y, 3, 1, white);
-    layer.fill_rect_signed(x, y - 1, 1, 3, white);
-}
-
+/// Transmit one frame. The RLE stream is produced twice: first to learn the
+/// payload length and CRC (nothing is stored), then to send. Each pass composes
+/// the frame pixel by pixel from the cached planes and the cursor.
 fn send_frame(
     usb: &mut UsbSerialJtag<'_, Blocking>,
-    engine: &mut Warp4Engine,
-    band: &mut LayerSystem,
+    shape: &[u8],
+    text: Option<&TextPlane>,
     cursor_x: i32,
     cursor_y: i32,
     seq: u32,
     chroma_carrier: bool,
 ) -> bool {
-    let pixel_count = LOGICAL_WIDTH * LOGICAL_HEIGHT;
-    // Layout is shared by every band. `update` only runs when the view tree or
-    // its size changed, so normal cursor motion does not re-measure the UI.
-    if engine.is_dirty() {
-        engine.update(LOGICAL_WIDTH as i32, LOGICAL_HEIGHT as i32);
-    }
-
-    // First pass: compute the payload CRC without storing a frame. Raw frames
-    // keep the protocol simple and let the viewer resynchronize after a
-    // truncated transfer; rendering twice is still much cheaper than a
-    // full-screen buffer in RAM.
+    let cursor = (cursor_x, cursor_y);
+    let mut payload_len = 0u32;
     let mut crc = 0xFFFF_FFFF_u32;
-    let mut band_y = 0usize;
-    while band_y < LOGICAL_HEIGHT {
-        let rows = BAND_HEIGHT.min(LOGICAL_HEIGHT - band_y);
-        draw_band(engine, band, band_y, cursor_x, cursor_y);
-        let pixels = band.buf_ref();
-        for row in 0..rows {
-            for x in 0..LOGICAL_WIDTH {
-                let sample = color_to_sample(
-                    pixels[row * LOGICAL_WIDTH + x],
-                    x,
-                    band_y + row,
-                    chroma_carrier,
-                );
-                crc = crc32_byte(crc, sample);
-            }
-        }
-        band_y += rows;
-    }
+    encode_frame_rle(
+        shape,
+        text,
+        LOGICAL_WIDTH,
+        LOGICAL_HEIGHT,
+        cursor,
+        chroma_carrier,
+        &mut |count, sample| {
+            crc = crc32_byte(crc, count);
+            crc = crc32_byte(crc, sample);
+            payload_len += 2;
+        },
+    );
     let crc = !crc;
 
-    let flags = FRAME_FLAG_8BIT | if chroma_carrier { FRAME_FLAG_CHROMA_CARRIER } else { 0 };
+    let flags = FRAME_FLAG_RLE
+        | FRAME_FLAG_8BIT
+        | if chroma_carrier { FRAME_FLAG_CHROMA_CARRIER } else { 0 };
     let mut header = [0_u8; FRAME_HEADER_LEN];
     header[0..4].copy_from_slice(&FRAME_MAGIC);
     header[4..6].copy_from_slice(&(LOGICAL_WIDTH as u16).to_le_bytes());
     header[6..8].copy_from_slice(&(LOGICAL_HEIGHT as u16).to_le_bytes());
     header[8..10].copy_from_slice(&flags.to_le_bytes());
     header[10..14].copy_from_slice(&seq.to_le_bytes());
-    header[14..18].copy_from_slice(&(pixel_count as u32).to_le_bytes());
+    header[14..18].copy_from_slice(&payload_len.to_le_bytes());
     header[18..22].copy_from_slice(&crc.to_le_bytes());
 
     let mut last_progress = Instant::now();
@@ -873,36 +816,34 @@ fn send_frame(
         return false;
     }
 
-    // Second pass: render each band again and stream it as raw RGB332 samples.
     let mut chunk = [0_u8; 256];
     let mut used = 0usize;
-    band_y = 0;
-    while band_y < LOGICAL_HEIGHT {
-        let rows = BAND_HEIGHT.min(LOGICAL_HEIGHT - band_y);
-        draw_band(engine, band, band_y, cursor_x, cursor_y);
-        let pixels = band.buf_ref();
-        for row in 0..rows {
-            for x in 0..LOGICAL_WIDTH {
-                chunk[used] = color_to_sample(
-                    pixels[row * LOGICAL_WIDTH + x],
-                    x,
-                    band_y + row,
-                    chroma_carrier,
-                );
-                used += 1;
-                if used == chunk.len() {
-                    if !write_all_nb(usb, &chunk, &mut last_progress) {
-                        return false;
-                    }
-                    used = 0;
-                }
+    let mut ok = true;
+    encode_frame_rle(
+        shape,
+        text,
+        LOGICAL_WIDTH,
+        LOGICAL_HEIGHT,
+        cursor,
+        chroma_carrier,
+        &mut |count, sample| {
+            if !ok {
+                return;
             }
-        }
-        band_y += rows;
+            chunk[used] = count;
+            chunk[used + 1] = sample;
+            used += 2;
+            if used == chunk.len() {
+                ok = write_all_nb(usb, &chunk, &mut last_progress);
+                used = 0;
+            }
+        },
+    );
+    if !ok {
+        return false;
     }
     if used > 0 && !write_all_nb(usb, &chunk[..used], &mut last_progress) {
         return false;
     }
-
     flush_nb(usb, &mut last_progress)
 }

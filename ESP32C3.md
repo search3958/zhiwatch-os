@@ -42,16 +42,35 @@ The script is equivalent to:
 
 ```sh
 rustup target add riscv32imc-unknown-none-elf
-cargo build --release -p baram-warp4 --example esp32c3 --target riscv32imc-unknown-none-elf --no-default-features --features esp32c3,bdf
+cargo build --release -p baram-warp4 --example esp32c3 --target riscv32imc-unknown-none-elf --no-default-features --features esp32c3,ttf
 espflash flash --before usb-reset target/riscv32imc-unknown-none-elf/release/examples/esp32c3
 ```
 
 `--before usb-reset` matters: while the firmware is streaming frames the normal
 DTR/RTS reset sequence cannot always enter the ROM download mode.
 
-The example config selects BDF fonts instead of TTF and allocates a 256 KiB heap.
-The logical framebuffer is 135x240 (129,600 bytes in the renderer's 32-bit pixel
-format) and is streamed to the host; no panel driver or RGB565 framebuffer is kept.
+The example config allocates a 256 KiB heap. The UI font is `files/data/ui/HMOS_SANS_SUBSET.ttf`,
+embedded in flash and copied into RAM at boot, then rasterized with 3-bit anti-aliasing.
+
+## Rendering pipeline and RAM
+
+The screen is cached as two planes, so cursor motion does not repaint the UI:
+
+* **Shape plane**: 135x240 8-bit RGB332, 32,400 bytes. Everything except text.
+* **Text plane**: 135x240 3-bit coverage, bit-packed, 12,150 bytes. Glyph color is not
+  stored per pixel; each text draw call is recorded as a run (bounding box + RGB332
+  color), at most 160 per frame.
+* **Band scratch**: 8 rows of 32-bit pixels, 4,320 bytes, used only while rebuilding.
+* **Font**: the TTF is copied to RAM, about 9.7 KB.
+
+The planes are rebuilt only when the UI is dirty (`engine.is_dirty()`). When a frame
+is transmitted, the shape, text and cursor are composed per pixel: text is blended
+over the shape with its coverage, and the cursor is drawn on top. Nothing is
+composed into a third buffer. A later opaque shape write removes the text beneath
+it (z-order is kept); translucent writes (shadows, global alpha) leave text visible.
+
+Approximate RAM: 32.4 KB shape + 12.2 KB text + 9.7 KB font + 4.3 KB band + glyph
+caches. This is well under the 100 KB budget.
 
 ## Frame stream protocol
 
@@ -62,15 +81,16 @@ magic "ZWF2" | width u16 | height u16 | flags u16 | seq u32 |
 payload_len u32 | crc32 u32
 ```
 
-* `flags` bit0: payload is RLE with entries `(run_count u8, sample u8)`.
-  Otherwise the payload is raw `width*height` 8-bit samples.
+* `flags` bit0: payload is RLE with entries `(run_count u8, sample u8)`, run_count
+  1..255. This is the only compression on the wire, and it is lossless. The payload
+  is always RLE.
 * `flags` bit1: Chroma subcarrier modulation mode (Y luminance base with chroma C modulated on subcarrier).
 * `flags` bit2: 8-bit color mode (RGB332).
 * `crc32` is the standard CRC-32 of the payload bytes as transmitted.
-* RLE is chosen automatically per frame when it is smaller than raw; 8-bit entries
-  cut transmission payload significantly, keeping higher FPS on the USB serial link.
-* Frames are sent only when the UI redraws, throttled to at most one per
-  `MIN_FRAME_INTERVAL_MS` (66 ms).
+* The frame is sent when the UI redraws or the cursor moves, throttled to at most one
+  per `MIN_FRAME_INTERVAL_MS` (66 ms). The UI is only repainted when it is dirty.
+* The RLE payload is produced twice per frame: once to get the length and CRC, once
+  to send. No frame buffer is needed for either pass.
 
 `tools/zhiwatch_viewer.py` implements the receiving side (pure Python, tkinter +
 pyserial, no other dependencies). Press **C** or click the **CHROMA CARRIER** button

@@ -23,10 +23,10 @@ struct GlyphEntry {
     y_off: i32,
 }
 
-pub fn init() {
-    let data = include_bytes!("../../../files/data/fonts/GoogleSansFlex_24pt-Medium.ttf");
+/// Initialize the HUD face from caller-supplied font bytes (copied to RAM).
+pub fn init_with_data(data: &[u8]) {
     unsafe {
-        FONT_DATA = Some(Vec::from(&data[..]));
+        FONT_DATA = Some(Vec::from(data));
         let mut info = stbtt_fontinfo::default();
         let font_vec = FONT_DATA.as_ref().unwrap();
         let res = stbtt_InitFont(&mut info, font_vec.as_ptr(), 0);

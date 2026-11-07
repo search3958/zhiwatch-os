@@ -2,13 +2,20 @@
 """Viewer for the ZhiWatch ESP32-C3 USB frame stream.
 
 The firmware streams frames over USB Serial/JTAG with this framing
-(all integers little-endian, pixels RGB565 big-endian):
+(all integers little-endian):
 
     magic "ZWF2" | width u16 | height u16 | flags u16 | seq u32 |
     payload_len u32 | crc32 u32
 
-flags bit0: payload is RLE with entries (run_count u8, color_hi u8, color_lo u8);
-otherwise the payload is raw width*height RGB565 samples.
+flags bit0: payload is RLE with entries (run_count u8, sample u8); the firmware
+always sends this lossless form.
+flags bit2: samples are 8-bit RGB332 (3 bits red, 3 bits green, 2 bits blue).
+flags bit1: samples are chroma-carrier modulated (approximate display mode).
+
+RGB332 samples are expanded exactly as the device's own pixel values: red and
+green are v*255//7 of their 3-bit fields and blue is v*255//3 of its 2-bit field.
+The viewer therefore shows the device's composed frame bit for bit in the
+normal (non-chroma) mode.
 
 The GUI also sends a small host-to-device input packet so the on-screen
 virtual joystick (and the keyboard) can drive the firmware's pointer:

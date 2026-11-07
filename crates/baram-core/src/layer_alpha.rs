@@ -17,7 +17,7 @@ impl LayerSystem {
         let Some((dx, dy, sx, sy, w, h)) = self.clipped_blit(dx, dy, sx, sy, w, h, sw, sh) else {
             return;
         };
-        self.mark_dirty_rect(dx, dy, dx + w, dy + h);
+        self.mark_dirty_rect_translucent(dx, dy, dx + w, dy + h);
 
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
         if avx2_available() {

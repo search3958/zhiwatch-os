@@ -33,15 +33,18 @@ struct SizedGlyphEntry {
     glyph: GlyphEntry,
 }
 
-pub fn init() {
-    let data = include_bytes!("../../../files/data/fonts/HarmonyOS_Sans_SC_Regular.ttf");
-    let korean_data = include_bytes!("../../../files/data/fonts/GothicA1-Medium.ttf");
+/// Initialize the primary UI face from font bytes.
+///
+/// The bytes are copied into RAM (heap), so the parser and glyph rasterizer
+/// never touch flash. Passing the bytes in keeps this crate free of asset
+/// paths: the application decides which font file is shipped.
+/// The subset HMOS face has no Korean fallback, so the fallback stays unset.
+pub fn init_with_data(data: &[u8]) {
     unsafe {
-        FONT_DATA = Some(Vec::from(&data[..]));
-        let mut info = stbtt_fontinfo::default();
+        FONT_DATA = Some(Vec::from(data));
         let font_vec = FONT_DATA.as_ref().unwrap();
-        let res = stbtt_InitFont(&mut info, font_vec.as_ptr(), 0);
-        if res == 0 {
+        let mut info = stbtt_fontinfo::default();
+        if stbtt_InitFont(&mut info, font_vec.as_ptr(), 0) == 0 {
             FONT_DATA = None;
             return;
         }
@@ -52,16 +55,30 @@ pub fn init() {
         stbtt_GetFontVMetrics(&mut info, &mut ascent, &mut descent, &mut line_gap);
         ASCENT = (ascent as f32 * FONT_SCALE + 0.5) as i32;
         FONT_INFO = Some(info);
-        let mut korean_info = stbtt_fontinfo::default();
-        KOREAN_FONT_DATA = Some(Vec::from(&korean_data[..]));
-        let korean_vec = KOREAN_FONT_DATA.as_ref().unwrap();
-        if stbtt_InitFont(&mut korean_info, korean_vec.as_ptr(), 0) != 0 {
-            KOREAN_FONT_INFO = Some(korean_info);
-        } else {
-            KOREAN_FONT_DATA = None;
-        }
+        KOREAN_FONT_INFO = None;
+        KOREAN_FONT_DATA = None;
         CACHE = Vec::with_capacity(CACHE_INIT_CAP);
         SIZED_CACHE = Vec::with_capacity(CACHE_INIT_CAP);
+    }
+}
+
+/// Default pixel size used by `ascent`, `glyph` and `advance`.
+pub fn default_size() -> f32 {
+    FONT_SIZE
+}
+
+/// Distance from ascender to descender at `pixel_size`, in pixels.
+pub fn line_height_at_size(pixel_size: f32) -> i32 {
+    unsafe {
+        let Some(info) = FONT_INFO.as_mut() else {
+            return 0;
+        };
+        let scale = stbtt_ScaleForPixelHeight(info, pixel_size);
+        let mut ascent = 0;
+        let mut descent = 0;
+        let mut line_gap = 0;
+        stbtt_GetFontVMetrics(info, &mut ascent, &mut descent, &mut line_gap);
+        ((ascent - descent) as f32 * scale + 0.5) as i32
     }
 }
 

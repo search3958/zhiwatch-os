@@ -192,6 +192,9 @@ pub struct LayerSystem {
     dirty_y0: usize,
     dirty_x1: usize,
     dirty_y1: usize,
+    /// Optional text plane (embedded renderer). `None` keeps the original
+    /// behaviour where text is blended straight into `buf`.
+    pub(crate) text: Option<crate::text_plane::TextPlane>,
 }
 
 

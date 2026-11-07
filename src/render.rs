@@ -9,6 +9,7 @@ fn blend_fractional_pixel_up(
     let width = dst.width().min(src.width());
     let height = dst.height().min(src.height());
     let top = top.min(height);
+    dst.occlude_text_signed(0, top as i32, width, height - top);
     let dst_buf = dst.buf_mut();
     let src_buf = src.buf_ref();
     for y in top..height {

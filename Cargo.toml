@@ -43,7 +43,7 @@ esp32c3 = [
 [[example]]
 name = "esp32c3"
 path = "examples/esp32c3.rs"
-required-features = ["esp32c3", "bdf"]
+required-features = ["esp32c3", "ttf"]
 
 [dependencies]
 baram-bsd = { path = "crates/baram-bsd", default-features = false }

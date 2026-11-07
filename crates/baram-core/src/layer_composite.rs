@@ -180,7 +180,7 @@ impl LayerSystem {
         let Some((dx, dy, sx, sy, w, h)) = self.clipped_blit(dx, dy, sx, sy, w, h, sw, sh) else {
             return;
         };
-        self.mark_dirty_rect(dx, dy, dx + w, dy + h);
+        self.mark_dirty_rect_translucent(dx, dy, dx + w, dy + h);
 
         for py in 0..h {
             let src_y = sy + py;
@@ -396,7 +396,7 @@ impl LayerSystem {
         ) else {
             return;
         };
-        self.mark_dirty_rect(x0, y0, x1, y1);
+        self.mark_dirty_rect_translucent(x0, y0, x1, y1);
         let sx = x0 - dx;
         let copy_w = x1 - x0;
         for y in y0..y1 {

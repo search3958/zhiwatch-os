@@ -105,22 +105,47 @@ pub unsafe fn memset(src: *mut u8, value: i32, count: u64) {
     core::ptr::write_bytes(src, value as u8, count as usize);
 }
 
+/// Every block carries its allocation size in a 16-byte header in front of the
+/// returned pointer. `free` and `realloc` need the exact layout to give memory
+/// back to the allocator; a fixed size here leaks blocks on allocators that
+/// track sizes (esp-alloc does), which exhausted the heap during glyph raster.
+const HEADER: usize = 16;
+
 pub unsafe fn malloc(count: u64) -> *mut u8 {
-    let layout = Layout::from_size_align(count as usize, 1).expect("Bad layout");
-    alloc::alloc::alloc(layout)
+    let total = count as usize + HEADER;
+    let layout = Layout::from_size_align(total, 16).expect("Bad layout");
+    let base = alloc::alloc::alloc(layout);
+    if base.is_null() {
+        return base;
+    }
+    *(base as *mut usize) = total;
+    base.add(HEADER)
 }
 
 pub unsafe fn realloc<T>(data: *mut T, count: u64) -> *mut u8 {
-    if data == core::ptr::null_mut() {
+    if data.is_null() {
         return malloc(count);
     }
-    let old_layout = Layout::from_size_align(1, 1).expect("Bad layout");
-    alloc::alloc::realloc(data as *mut u8, old_layout, count as usize)
+    let base = (data as *mut u8).sub(HEADER);
+    let old_total = *(base as *mut usize);
+    let new_total = count as usize + HEADER;
+    let layout = Layout::from_size_align(old_total, 16).expect("Bad layout");
+    let moved = alloc::alloc::realloc(base, layout, new_total);
+    if moved.is_null() {
+        return moved;
+    }
+    *(moved as *mut usize) = new_total;
+    moved.add(HEADER)
 }
 
 pub unsafe fn free<T>(data: *mut T) {
-    let layout = Layout::from_size_align(1, 1).expect("Bad layout");
-    alloc::alloc::dealloc(data as *mut u8, layout);
+    if data.is_null() {
+        return;
+    }
+    let base = (data as *mut u8).sub(HEADER);
+    let total = *(base as *mut usize);
+    let layout = Layout::from_size_align(total, 16).expect("Bad layout");
+    alloc::alloc::dealloc(base, layout);
 }
 
 pub fn _lrotl(x: u32, y: i32) -> u32 {

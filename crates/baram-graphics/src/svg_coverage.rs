@@ -4,6 +4,7 @@ fn blend_pixel(layer: &mut LayerSystem, x: usize, y: usize, c: Color, coverage: 
         return;
     }
     let cov = if coverage >= 1.0 { 1.0 } else { coverage };
+    layer.occlude_text_signed(x as i32, y as i32, 1, 1);
     let w = layer.width();
     let buf = &mut layer.buf_mut()[y * w..];
     if cov >= 1.0 {
@@ -147,6 +148,7 @@ fn paint_span(layer: &mut LayerSystem, x0: f64, x1: f64, py: usize, color: Color
     let lw = layer.width() as i32;
     let x0i = libm::floor(x0) as i32;
     let x1i = libm::ceil(x1) as i32;
+    layer.occlude_text_signed(x0i, py as i32, (x1i - x0i).max(0) as usize, 1);
     if x1i <= 0 || x0i >= lw {
         return;
     }

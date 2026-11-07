@@ -2,7 +2,7 @@ use crate::font;
 use crate::bdf_font;
 #[cfg(feature = "ttf")]
 use crate::ttf_font;
-#[cfg(feature = "ttf")]
+#[cfg(all(feature = "ttf", not(feature = "esp32c3")))]
 use crate::ttf_font_hud;
 use baram_core::{Color, LayerSystem};
 
@@ -12,8 +12,95 @@ pub trait LayerFontExt {
     fn put_str_hud(&mut self, x: usize, y: usize, s: &str, fg: Color);
 }
 
+/// Draw a string into the layer's text plane (3-bit coverage + one color for
+/// the whole call). Returns false when the plane or the TTF face is missing,
+/// in which case the caller falls back to drawing into the shape buffer.
+///
+/// `y` is the top of the line box; `size` selects a pixel size (None uses the
+/// default size of the face).
+#[cfg(feature = "ttf")]
+pub fn put_text_plane(
+    layer: &mut LayerSystem,
+    x: i32,
+    y: i32,
+    s: &str,
+    fg: Color,
+    size: Option<f32>,
+) -> bool {
+    if !layer.text_active() || !ttf_font::is_available() {
+        return false;
+    }
+    let px_size = size.unwrap_or_else(ttf_font::default_size);
+    let baseline = y + ttf_font::ascent_at_size(px_size);
+    let height = ttf_font::line_height_at_size(px_size);
+    // Measure first so the run's bounds cover every glyph of this string.
+    let mut width = 0;
+    for ch in s.chars() {
+        width += glyph_advance(ch, px_size);
+    }
+    layer.text_begin_run(x - 2, y, x + width + 2, y + height, fg);
+    let mut cursor = x;
+    for ch in s.chars() {
+        cursor += draw_glyph_plane(layer, cursor, baseline, ch, px_size);
+    }
+    true
+}
+
+#[cfg(feature = "ttf")]
+fn glyph_advance(ch: char, size: f32) -> i32 {
+    let advance = ttf_font::with_glyph_at_size(ch, size, |_data, _w, _h, advance, _y_off| advance);
+    if advance > 0 {
+        advance
+    } else if (ch as u32) < 0x80 {
+        font::GLYPH_W as i32
+    } else {
+        0
+    }
+}
+
+/// Write one glyph's coverage into the text plane. Only rows and columns that
+/// fall inside the current clip are visited, so each band pass costs in
+/// proportion to the glyph pixels it actually covers.
+#[cfg(feature = "ttf")]
+fn draw_glyph_plane(layer: &mut LayerSystem, x: i32, baseline: i32, ch: char, size: f32) -> i32 {
+    let (cx0, cy0, cx1, cy1) = layer.clip_bounds();
+    let advance = ttf_font::with_glyph_at_size(ch, size, |data, gw, gh, advance, y_off| {
+        if gw > 0 && gh > 0 {
+            let top = baseline + y_off;
+            let r0 = (cy0 as i32 - top).max(0);
+            let r1 = (cy1 as i32 - top).min(gh);
+            let c0 = (cx0 as i32 - x).max(0);
+            let c1 = (cx1 as i32 - x).min(gw);
+            for row in r0..r1 {
+                for col in c0..c1 {
+                    let alpha = data[(row * gw + col) as usize];
+                    if alpha != 0 {
+                        layer.text_put_coverage(x + col, top + row, alpha);
+                    }
+                }
+            }
+        }
+        advance
+    });
+    if advance > 0 {
+        advance
+    } else if (ch as u32) < 0x80 {
+        font::GLYPH_W as i32
+    } else {
+        0
+    }
+}
+
 impl LayerFontExt for LayerSystem {
     fn put_char(&mut self, x: usize, y: usize, ch: char, fg: Color) {
+        #[cfg(feature = "ttf")]
+        {
+            let mut utf8 = [0u8; 4];
+            let text: &str = ch.encode_utf8(&mut utf8);
+            if put_text_plane(self, x as i32, y as i32, text, fg, None) {
+                return;
+            }
+        }
         if bdf_font::is_available() {
             let w = self.width();
             let (clip_x0, clip_y0, clip_x1, clip_y1) = self.clip_bounds();
@@ -105,6 +192,10 @@ impl LayerFontExt for LayerSystem {
     }
 
     fn put_str(&mut self, mut x: usize, y: usize, s: &str, fg: Color) {
+        #[cfg(feature = "ttf")]
+        if put_text_plane(self, x as i32, y as i32, s, fg, None) {
+            return;
+        }
         if bdf_font::is_available() {
             for ch in s.chars() {
                 self.put_char(x, y, ch, fg);
@@ -144,7 +235,7 @@ impl LayerFontExt for LayerSystem {
             self.put_str(x, y, s, fg);
             return;
         }
-        #[cfg(feature = "ttf")]
+        #[cfg(all(feature = "ttf", not(feature = "esp32c3")))]
         if ttf_font_hud::is_available() {
             for ch in s.chars() {
                 let glyph = ttf_font_hud::glyph(ch);

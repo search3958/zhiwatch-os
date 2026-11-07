@@ -471,6 +471,10 @@ pub(crate) fn put_str_size(
     color: Color,
     size: f32,
 ) {
+    #[cfg(feature = "ttf")]
+    if baram_font::put_text_plane(layer, x, y, text, color, Some(size)) {
+        return;
+    }
     if bdf_font::is_available() {
         let width = layer.width();
         let (clip_x0, clip_y0, clip_x1, clip_y1) = layer.clip_bounds();
@@ -598,6 +602,7 @@ pub(crate) fn draw_check_icon(layer: &mut LayerSystem, x: i32, y: i32) {
                     continue;
                 }
                 let index = py as usize * layer_w + px as usize;
+                layer.occlude_text_signed(px, py, 1, 1);
                 let background = layer.buf_ref()[index];
                 layer.buf_mut()[index] = LayerSystem::blend_alpha(
                     background,

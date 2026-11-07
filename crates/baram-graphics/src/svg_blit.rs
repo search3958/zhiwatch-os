@@ -11,6 +11,7 @@ pub fn blit_cached_alpha(
     oy: i32,
     alpha_scale: u32,
 ) {
+    layer.occlude_text_signed(ox, oy, w, h);
     let lw = layer.width();
     let lh = layer.height();
     let buf = layer.buf_mut();
@@ -191,6 +192,7 @@ pub fn blit_cached_scaled(
         blit_cached(layer, pixels, w, h, ox, oy);
         return;
     }
+    layer.occlude_text_signed(ox, oy, w * scale as usize, h * scale as usize);
     let lw = layer.width();
     let lh = layer.height();
     let buf = layer.buf_mut();

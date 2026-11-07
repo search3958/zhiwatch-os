@@ -12,6 +12,7 @@ impl LayerSystem {
             dirty_y0: 0,
             dirty_x1: w,
             dirty_y1: h,
+            text: None,
         }
     }
 
@@ -28,6 +29,7 @@ impl LayerSystem {
             dirty_y0: 0,
             dirty_x1: w,
             dirty_y1: h,
+            text: None,
         }
     }
 
@@ -50,6 +52,7 @@ impl LayerSystem {
             dirty_y0: 0,
             dirty_x1: w,
             dirty_y1: h,
+            text: None,
         }
     }
 
@@ -81,8 +84,23 @@ impl LayerSystem {
         self.clip.unwrap_or((0, 0, self.width, self.height))
     }
 
+    /// Record an opaque write. Text previously drawn under the rectangle is
+    /// removed from the text plane so that z-order is kept.
     #[inline]
     fn mark_dirty_rect(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        self.occlude_text(x0, y0, x1, y1);
+        self.mark_dirty_only(x0, y0, x1, y1);
+    }
+
+    /// Record a translucent write (shadows, global alpha). Text stays visible
+    /// under it, because it is blended rather than replaced.
+    #[inline]
+    fn mark_dirty_rect_translucent(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
+        self.mark_dirty_only(x0, y0, x1, y1);
+    }
+
+    #[inline]
+    fn mark_dirty_only(&mut self, x0: usize, y0: usize, x1: usize, y1: usize) {
         if !self.dirty {
             self.dirty = true;
             self.dirty_x0 = x0;
@@ -246,6 +264,7 @@ impl LayerSystem {
     }
 
     pub fn clear(&mut self, c: Color) {
+        self.occlude_text(0, 0, self.width, self.height);
         self.buf.fill(c.0);
         self.mark_all_dirty();
     }
@@ -253,6 +272,7 @@ impl LayerSystem {
     #[inline]
     pub fn put_pixel(&mut self, x: usize, y: usize, c: Color) {
         if x < self.width && y < self.height && self.clip_test(x, y) {
+            self.occlude_text(x, y, x + 1, y + 1);
             self.buf[y * self.width + x] = c.0;
         }
     }

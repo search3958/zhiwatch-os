@@ -9,7 +9,7 @@ pub mod layer_ext;
 pub mod log;
 #[cfg(feature = "ttf")]
 pub mod ttf_font;
-#[cfg(feature = "ttf")]
+#[cfg(all(feature = "ttf", not(feature = "esp32c3")))]
 pub mod ttf_font_hud;
 
 pub use font::{glyph as bitmap_glyph, GLYPH_H, GLYPH_W};
@@ -17,3 +17,5 @@ pub use layer_ext::LayerFontExt;
 pub use log::log_line_str;
 #[cfg(feature = "ttf")]
 pub use ttf_font::{ascent, ascent_at_size, glyph, glyph_at_size, is_available, GlyphBitmap};
+#[cfg(feature = "ttf")]
+pub use layer_ext::put_text_plane;

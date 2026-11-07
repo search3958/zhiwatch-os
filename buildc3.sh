@@ -23,7 +23,7 @@ cd "$SCRIPT_DIR"
 
 TARGET="riscv32imc-unknown-none-elf"
 BIN="target/$TARGET/release/examples/esp32c3"
-FEATURES="esp32c3,bdf"
+FEATURES="esp32c3,ttf"
 
 log()  { printf "\033[1;34m[buildc3]\033[0m %s\n" "$*"; }
 die()  { printf "\033[1;31m[err ]\033[0m %s\n" "$*" >&2; exit 1; }

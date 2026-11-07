@@ -42,13 +42,15 @@ pub unsafe fn stbtt__hheap_alloc(
         return p;
     } else {
         if (*hh).num_remaining_in_head_chunk == 0 {
+            // Chunk sizes are kept small for the 256 KiB device heap. The pool
+            // chains new chunks on demand, so only the peak changes.
             let count: i32 = if size < ((32) as u64) {
-                2000
+                128
             } else {
                 if size < ((128) as u64) {
-                    800
+                    64
                 } else {
-                    100
+                    32
                 }
             };
             let c: *mut stbtt__hheap_chunk = (c_runtime::malloc(
