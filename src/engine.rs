@@ -266,6 +266,66 @@ impl Warp4Engine {
             }
     }
 
+    /// Screen rectangle (x, y, w, h) of the keyboard-focused control.
+    pub fn keyboard_focus_rect(&self) -> Option<(i32, i32, i32, i32)> {
+        let idx = self.keyboard_focus?;
+        let node = self.nodes.get(idx)?;
+        Some((node.x, self.node_screen_y(idx), node.w.max(1), node.h.max(1)))
+    }
+
+    /// Move focus to the nearest focusable control in one of four directions,
+    /// like an arrow key. `dx` and `dy` are -1, 0 or 1 in screen coordinates
+    /// (+x right, +y down); only one axis should be non-zero. A candidate must
+    /// lie ahead of the current control. Off-axis distance counts double, so a
+    /// neighbour straight ahead wins over a nearer one at an angle. Returns
+    /// false when nothing lies in that direction, and focus stays put.
+    pub fn focus_spatial(&mut self, dx: i32, dy: i32) -> bool {
+        if dx == 0 && dy == 0 {
+            return false;
+        }
+        let Some(current) = self.keyboard_focus else {
+            return self.focus_direction(if dx < 0 || dy < 0 { -1 } else { 1 });
+        };
+        let Some((cx, cy, cw, ch)) = self.keyboard_focus_rect() else {
+            return false;
+        };
+        // Doubled centers keep everything in integers.
+        let (ccx, ccy) = (cx as i64 * 2 + cw as i64, cy as i64 * 2 + ch as i64);
+        let mut best: Option<(i64, usize)> = None;
+        for idx in 0..self.nodes.len() {
+            if idx == current {
+                continue;
+            }
+            let node = &self.nodes[idx];
+            if !(node.visible() && self.active_child(idx) && is_keyboard_focusable(node)) {
+                continue;
+            }
+            let ex = node.x as i64 * 2 + node.w.max(1) as i64;
+            let ey = self.node_screen_y(idx) as i64 * 2 + node.h.max(1) as i64;
+            let vx = ex - ccx;
+            let vy = ey - ccy;
+            let (ahead, off) = if dx != 0 {
+                (vx * dx.signum() as i64, vy.abs())
+            } else {
+                (vy * dy.signum() as i64, vx.abs())
+            };
+            if ahead <= 0 {
+                continue;
+            }
+            let score = ahead + 2 * off;
+            if best.map_or(true, |(s, _)| score < s) {
+                best = Some((score, idx));
+            }
+        }
+        let Some((_, next)) = best else {
+            return false;
+        };
+        self.keyboard_focus = Some(next);
+        self.ensure_keyboard_focus_visible(next);
+        self.dirty = true;
+        true
+    }
+
     /// Activate the currently focused button as if Space had clicked it.
     /// Text fields are left to the normal text-input path.
     pub fn activate_focused(&mut self) -> bool {

@@ -177,10 +177,15 @@ impl TextPlane {
 }
 
 /// RGB332 (8-bit color) pack used by the device: 3 bits red, 3 bits green,
-/// 2 bits blue. The value is truncated, matching the shape-plane conversion.
+/// 2 bits blue. Each channel is rounded to the nearest level. Truncation was
+/// used before, but it pulls dark grays toward olive (0x3A3A3C became
+/// (36,36,0)) and makes some UI colors vanish into their background.
 #[inline]
 pub fn rgb332_from_rgb(r: u8, g: u8, b: u8) -> u8 {
-    (r & 0xE0) | ((g & 0xE0) >> 3) | (b >> 6)
+    let r3 = (r as u16 * 7 + 127) / 255;
+    let g3 = (g as u16 * 7 + 127) / 255;
+    let b2 = (b as u16 * 3 + 127) / 255;
+    ((r3 as u8) << 5) | ((g3 as u8) << 2) | (b2 as u8)
 }
 
 #[inline]

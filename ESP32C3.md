@@ -105,11 +105,25 @@ the virtual stick and Space keep working while it is disabled. **R** or the
 **RESTART** button asks for confirmation and reboots the board. The viewer then
 reconnects automatically when the USB device re-enumerates.
 
+## Joystick as arrow keys
+
+The stick does not move a pointer. Its dominant axis moves keyboard focus to the
+nearest focusable control in that direction (up, down, left, right), using the
+on-screen positions of the controls. Holding a direction repeats after 380 ms and
+then every 170 ms. The button activates the focused control, like Space. The
+focused control is outlined with a light 1-pixel frame on Xiao.
+
+Only the rows of the old and new control are repainted after a focus move. A
+scroll (the focused control was off-screen) or any other UI change rebuilds the
+whole frame. Every 2 seconds the firmware logs a `[perf]` line with the frame rate,
+full and partial rebuild counts, and the average rebuild and send times in
+microseconds.
+
 ## Virtual joystick (host input)
 
 The GUI shows a virtual joystick next to the streamed frame. Drag the pad with
-the mouse (or a touchscreen that emits normal pointer events), or use the arrow
-keys; **Space** presses the joystick button. **C** toggles Chroma Carrier mode,
+the mouse, or use the arrow keys; each deflection moves focus one control (see
+"Joystick as arrow keys" above). **Space** presses the joystick button. **C** toggles Chroma Carrier mode,
 **J** toggles the physical stick, **R** restarts the device, **P** pauses the
 display and **Q**/Escape quits. The virtual stick overrides the physical stick
 while it is deflected, and the virtual button and physical button are OR-ed

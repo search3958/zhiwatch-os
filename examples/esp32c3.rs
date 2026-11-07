@@ -53,6 +53,14 @@ const FRAME_FLAG_CHROMA_CARRIER: u16 = 2;
 const FRAME_FLAG_8BIT: u16 = 4;
 // The UI font: the HMOS subset is copied to RAM at boot (see main).
 const FONT_BYTES: &[u8] = include_bytes!("../files/data/ui/HMOS_SANS_SUBSET.ttf");
+// The stick moves keyboard focus like arrow keys. Holding a direction repeats
+// after the first delay, then at the repeat rate.
+const NAV_FIRST_REPEAT_MS: u64 = 380;
+const NAV_REPEAT_MS: u64 = 170;
+// Coordinates that keep the frame cursor off-screen. The cursor is no longer
+// used for pointing; focus is.
+const NO_CURSOR: i32 = -1000;
+const PERF_REPORT_MS: u64 = 2000;
 // Give up on a frame if the host stops draining the USB FIFO for this long,
 // so the input loop keeps running when no viewer is attached.
 const USB_STALL_TIMEOUT_MS: u64 = 30;
@@ -216,21 +224,27 @@ fn main() -> ! {
     let cache_bytes = shape.len()
         + band.text_plane().map(TextPlane::ram_bytes).unwrap_or(0);
     esp_println::println!("[ok] Frame cache: shape {} B + text plane {} B", shape.len(), cache_bytes - shape.len());
-    let mut cursor_x = (LOGICAL_WIDTH / 2) as i32;
-    let mut cursor_y = (LOGICAL_HEIGHT / 2) as i32;
+    let cursor_x = NO_CURSOR;
+    let cursor_y = NO_CURSOR;
     let mut chroma_carrier_mode = false;
-    let _ = engine.set_hover_changed(cursor_x, cursor_y);
 
     let mut seq = 0_u32;
     let mut last_frame_sent: Option<Instant> = None;
     let mut pending_send = true;
     let mut cache_valid = false;
-    let mut cursor_dirty = false;
     let mut stream_active = false;
 
     let mut now_ns = 0_u64;
     let boot_instant = Instant::now();
     let mut previous_button_down = false;
+    let mut nav_held = (0_i32, 0_i32);
+    let mut nav_next_ms: Option<u64> = None;
+    // Rows of the screen that the last focus move changed, and whether the
+    // whole frame must be rebuilt instead.
+    let mut focus_damage: Option<(i32, i32)> = None;
+    let mut full_redraw = false;
+    let mut perf = Perf::default();
+    let mut last_perf_ms = 0_u64;
     let mut x_adc_fault = false;
     let mut y_adc_fault = false;
     let mut input_parser = HostParser::new();
@@ -369,44 +383,62 @@ fn main() -> ! {
 
         engine.tick(now_ns);
 
-        if dx != 0 || dy != 0 {
-            let next_x = (cursor_x + dx).clamp(0, LOGICAL_WIDTH as i32 - 1);
-            let next_y = (cursor_y + dy).clamp(0, LOGICAL_HEIGHT as i32 - 1);
-            if next_x != cursor_x || next_y != cursor_y {
-                cursor_x = next_x;
-                cursor_y = next_y;
-                let _ = engine.set_hover_changed(cursor_x, cursor_y);
-                cursor_dirty = true;
-            }
+        // The stick moves focus like arrow keys. The dominant axis picks the
+        // direction; a new direction moves at once, a held one repeats.
+        let (nav_x, nav_y) = dominant_direction(dx, dy);
+        let now_ms = boot_instant.elapsed().as_millis() as u64;
+        if (nav_x, nav_y) == (0, 0) {
+            nav_held = (0, 0);
+            nav_next_ms = None;
+        } else if (nav_x, nav_y) != nav_held {
+            nav_held = (nav_x, nav_y);
+            nav_next_ms = Some(now_ms + NAV_FIRST_REPEAT_MS);
+            move_focus(&mut engine, nav_x, nav_y, &mut focus_damage, &mut full_redraw);
+        } else if nav_next_ms.is_some_and(|due| now_ms >= due) {
+            nav_next_ms = Some(now_ms + NAV_REPEAT_MS);
+            move_focus(&mut engine, nav_x, nav_y, &mut focus_damage, &mut full_redraw);
         }
 
+        // Button press activates the focused control, like Space. Activation
+        // can change any part of the UI, so the whole frame is rebuilt.
         // esp-hal's `Input::is_low()` is an inherent method returning `bool`.
         let button_down = (physical_joystick_enabled && joystick_button.is_low())
             || virtual_button;
         if button_down && !previous_button_down {
-            engine.click(cursor_x, cursor_y);
-            esp_println::println!("[input] Joystick pressed at ({}, {})", cursor_x, cursor_y);
+            if engine.activate_focused() {
+                full_redraw = true;
+                esp_println::println!("[input] focused control activated");
+            }
         } else if !button_down && previous_button_down {
             engine.release();
         }
         previous_button_down = button_down;
 
-        // The shape and text planes are rebuilt only when the UI changed. A
-        // cursor step never touches them: it is composed into the frame at
-        // transmit time. Rebuilds are not throttled, so the cache stays current.
-        if engine.is_dirty() || !cache_valid {
-            rebuild_cache(&mut engine, &mut band, &mut shape);
+        // The planes are rebuilt only when the UI changed. A focus move repaints
+        // only the rows it touched (the old and new control), unless scrolling
+        // is involved; then the whole frame is rebuilt.
+        if engine.is_dirty() || !cache_valid || full_redraw {
+            let started = Instant::now();
+            match focus_damage.take() {
+                Some((y0, y1)) if cache_valid && !full_redraw && !engine.is_animating() => {
+                    rebuild_rows(&mut engine, &mut band, &mut shape, y0, y1);
+                    perf.partial_rebuilds += 1;
+                }
+                _ => {
+                    rebuild_cache(&mut engine, &mut band, &mut shape);
+                    perf.full_rebuilds += 1;
+                }
+            }
+            perf.rebuild_us += started.elapsed().as_micros() as u64;
+            full_redraw = false;
             cache_valid = true;
-            pending_send = true;
-        }
-        if cursor_dirty {
-            cursor_dirty = false;
             pending_send = true;
         }
 
         // Transmit at most once per MIN_FRAME_INTERVAL_MS.
         if pending_send {
-            match try_send(
+            let started = Instant::now();
+            let attempt = try_send(
                 &mut usb,
                 &shape,
                 band.text_plane(),
@@ -415,7 +447,12 @@ fn main() -> ! {
                 &mut seq,
                 &mut last_frame_sent,
                 chroma_carrier_mode,
-            ) {
+            );
+            if let Some(true) = attempt {
+                perf.send_us += started.elapsed().as_micros() as u64;
+                perf.frames += 1;
+            }
+            match attempt {
                 Some(sent) => {
                     pending_send = !sent;
                     if sent != stream_active {
@@ -430,6 +467,26 @@ fn main() -> ! {
                 // Throttled: send when the next frame is due.
                 None => {}
             }
+        }
+
+        let report_now = boot_instant.elapsed().as_millis() as u64;
+        if report_now.saturating_sub(last_perf_ms) >= PERF_REPORT_MS {
+            let elapsed_ms = (report_now - last_perf_ms).max(1);
+            // Frames per second with one decimal place.
+            let fps_x10 = perf.frames as u64 * 10_000 / elapsed_ms;
+            if perf.frames > 0 || perf.full_rebuilds + perf.partial_rebuilds > 0 {
+                esp_println::println!(
+                    "[perf] fps {}.{} | rebuild full {} partial {} avg {} us | send avg {} us",
+                    fps_x10 / 10,
+                    fps_x10 % 10,
+                    perf.full_rebuilds,
+                    perf.partial_rebuilds,
+                    perf.rebuild_us / (perf.full_rebuilds + perf.partial_rebuilds).max(1) as u64,
+                    perf.send_us / perf.frames.max(1) as u64,
+                );
+            }
+            perf = Perf::default();
+            last_perf_ms = report_now;
         }
 
         // Report heap/flash usage once a second while frames are flowing, and
@@ -745,27 +802,94 @@ fn flush_nb(usb: &mut UsbSerialJtag<'_, Blocking>, last_progress: &mut Instant) 
 }
 
 
-/// Rebuild the shape plane from the UI. Each band is painted into the 32-bit
-/// band scratch (8 rows), then converted to RGB332 in the shape plane. Text
-/// goes into the band's text plane at the same time. This runs only when the
-/// UI is dirty, not on cursor motion.
+/// Running counters for the once-per-report timing line.
+#[derive(Default)]
+struct Perf {
+    full_rebuilds: u32,
+    partial_rebuilds: u32,
+    rebuild_us: u64,
+    frames: u32,
+    send_us: u64,
+}
+
+/// Turn the stick deflection into one of the four arrow directions. The
+/// dominant axis wins; ties go to the horizontal axis.
+fn dominant_direction(dx: i32, dy: i32) -> (i32, i32) {
+    if dx == 0 && dy == 0 {
+        (0, 0)
+    } else if dx != 0 && dx.abs() >= dy.abs() {
+        (dx.signum(), 0)
+    } else {
+        (0, dy.signum())
+    }
+}
+
+/// Move focus one control in a direction. Records the screen rows that change
+/// (the old and new control) so only those bands are repainted. A scroll
+/// starts a full rebuild, because the whole content moves.
+fn move_focus(
+    engine: &mut Warp4Engine,
+    dx: i32,
+    dy: i32,
+    damage: &mut Option<(i32, i32)>,
+    full_redraw: &mut bool,
+) {
+    let before = engine.keyboard_focus_rect();
+    let scroll_before = engine.scroll_position();
+    if !engine.focus_spatial(dx, dy) {
+        return;
+    }
+    if engine.scroll_position() != scroll_before {
+        *full_redraw = true;
+        return;
+    }
+    for (_, y, _, h) in [before, engine.keyboard_focus_rect()].into_iter().flatten() {
+        let (y0, y1) = (y, y + h);
+        *damage = Some(match *damage {
+            Some((a, b)) => (a.min(y0), b.max(y1)),
+            None => (y0, y1),
+        });
+    }
+}
+
+/// Rebuild the shape plane and text plane for every band (full frame).
 fn rebuild_cache(engine: &mut Warp4Engine, band: &mut LayerSystem, shape: &mut [u8]) {
     if engine.is_dirty() {
         engine.update(LOGICAL_WIDTH as i32, LOGICAL_HEIGHT as i32);
     }
     let mut band_y = 0usize;
     while band_y < LOGICAL_HEIGHT {
-        let rows = BAND_HEIGHT.min(LOGICAL_HEIGHT - band_y);
-        band.set_text_origin(band_y);
-        engine.draw_band_to_layer(band, band_y as i32);
-        let pixels = band.buf_ref();
-        for row in 0..rows {
-            let dst = &mut shape[(band_y + row) * LOGICAL_WIDTH..(band_y + row + 1) * LOGICAL_WIDTH];
-            for (x, out) in dst.iter_mut().enumerate() {
-                *out = rgb332_from_color(Color(pixels[row * LOGICAL_WIDTH + x]));
-            }
+        rebuild_band(engine, band, shape, band_y);
+        band_y += BAND_HEIGHT;
+    }
+}
+
+/// Rebuild only the bands that overlap screen rows `y0..y1`.
+fn rebuild_rows(engine: &mut Warp4Engine, band: &mut LayerSystem, shape: &mut [u8], y0: i32, y1: i32) {
+    if engine.is_dirty() {
+        engine.update(LOGICAL_WIDTH as i32, LOGICAL_HEIGHT as i32);
+    }
+    let end = y1.clamp(0, LOGICAL_HEIGHT as i32) as usize;
+    let mut band_y = (y0.clamp(0, LOGICAL_HEIGHT as i32) as usize / BAND_HEIGHT) * BAND_HEIGHT;
+    while band_y < end {
+        rebuild_band(engine, band, shape, band_y);
+        band_y += BAND_HEIGHT;
+    }
+}
+
+/// Paint one band into the text plane and the shape plane. The band pass fills
+/// its own rows first, so text from the previous frame in those rows is
+/// cleared by the same occlusion rule as any other shape write.
+fn rebuild_band(engine: &mut Warp4Engine, band: &mut LayerSystem, shape: &mut [u8], band_y: usize) {
+    let rows = BAND_HEIGHT.min(LOGICAL_HEIGHT - band_y);
+    band.set_text_origin(band_y);
+    engine.draw_band_to_layer(band, band_y as i32);
+    let pixels = band.buf_ref();
+    for row in 0..rows {
+        let dst = &mut shape[(band_y + row) * LOGICAL_WIDTH..(band_y + row + 1) * LOGICAL_WIDTH];
+        for (x, out) in dst.iter_mut().enumerate() {
+            *out = rgb332_from_color(Color(pixels[row * LOGICAL_WIDTH + x]));
         }
-        band_y += rows;
     }
 }
 

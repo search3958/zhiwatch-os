@@ -488,6 +488,21 @@ impl LayerSystem {
         );
     }
 
+    /// One-pixel rectangle outline at a signed origin. Edges outside the layer
+    /// are clipped, not moved, so a rectangle that starts above a band keeps its
+    /// true position instead of being pinned to the band's top row.
+    pub fn rect_outline_signed(&mut self, x: i32, y: i32, w: usize, h: usize, c: Color) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let right = x.saturating_add(w as i32 - 1);
+        let bottom = y.saturating_add(h as i32 - 1);
+        self.fill_rect_signed(x, y, w, 1, c);
+        self.fill_rect_signed(x, bottom, w, 1, c);
+        self.fill_rect_signed(x, y, 1, h, c);
+        self.fill_rect_signed(right, y, 1, h, c);
+    }
+
     pub fn rect_outline(&mut self, x: usize, y: usize, w: usize, h: usize, c: Color) {
         if w == 0 || h == 0 {
             return;

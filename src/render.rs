@@ -357,12 +357,20 @@ impl Warp4Engine {
                 // Keep the focus indication inside the button's existing
                 // one-pixel frame so keyboard navigation is visible without
                 // changing XML geometry.
-                layer.rect_outline(
-                    x.saturating_add(3).max(0) as usize,
-                    y.saturating_add(3).max(0) as usize,
+                // The origin stays signed: a button above the current band
+                // must not be pinned to the band's top row (that repeated the
+                // frame down every band).
+                let ring = if is_xiao() {
+                    Color::rgb(0xF2, 0xF2, 0xF7)
+                } else {
+                    Color::BLACK
+                };
+                layer.rect_outline_signed(
+                    x.saturating_add(3),
+                    y.saturating_add(3),
                     w.saturating_sub(6),
                     h.saturating_sub(6),
-                    Color::BLACK,
+                    ring,
                 );
             }
         } else if n.is("EditText")
@@ -822,20 +830,20 @@ impl Warp4Engine {
                 let max_thumb_y = track_h - thumb_h;
                 let max_scroll = n.content_h.saturating_sub(n.h).max(1);
                 let thumb_y = max_thumb_y * self.scroll / max_scroll;
-                let bar_x = (x + n.w - ui_px(8)).max(0) as usize;
-                fill_ui_rounded_rect(
+                let bar_x = x + n.w - ui_px(8);
+                fill_ui_rounded_rect_at(
                     layer,
                     bar_x,
-                    (y + ui_px(1)).max(0) as usize,
+                    y + ui_px(1),
                     ui_px_usize(6).max(1),
                     track_h as usize,
                     ui_px_usize(SCROLLBAR_RADIUS),
                     palette().scrollbar_track,
                 );
-                fill_ui_rounded_rect(
+                fill_ui_rounded_rect_at(
                     layer,
                     bar_x,
-                    (y + ui_px(1) + thumb_y).max(0) as usize,
+                    y + ui_px(1) + thumb_y,
                     ui_px_usize(6).max(1),
                     thumb_h as usize,
                     ui_px_usize(SCROLLBAR_RADIUS),
@@ -847,19 +855,19 @@ impl Warp4Engine {
                 let max_thumb_x = track_w - thumb_w;
                 let max_scroll = n.content_w.saturating_sub(n.w).max(1);
                 let thumb_x = max_thumb_x * self.scroll / max_scroll;
-                fill_ui_rounded_rect(
+                fill_ui_rounded_rect_at(
                     layer,
-                    (x + ui_px(1)).max(0) as usize,
-                    (y + n.h - ui_px(6)).max(0) as usize,
+                    x + ui_px(1),
+                    y + n.h - ui_px(6),
                     track_w as usize,
                     ui_px_usize(6).max(1),
                     ui_px_usize(SCROLLBAR_RADIUS),
                     palette().scrollbar_track,
                 );
-                fill_ui_rounded_rect(
+                fill_ui_rounded_rect_at(
                     layer,
-                    (x + ui_px(1) + thumb_x).max(0) as usize,
-                    (y + n.h - ui_px(6)).max(0) as usize,
+                    x + ui_px(1) + thumb_x,
+                    y + n.h - ui_px(6),
                     thumb_w as usize,
                     ui_px_usize(6).max(1),
                     ui_px_usize(SCROLLBAR_RADIUS),
